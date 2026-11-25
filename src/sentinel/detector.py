@@ -5,9 +5,12 @@ import re
 import time
 from enum import StrEnum
 from types import UnionType
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+if TYPE_CHECKING:
+    from sentinel.llm_fallback import SchemaMappingProvider
 
 
 class PrimitiveKind(StrEnum):
@@ -203,6 +206,13 @@ def _resolve_expected_type(
     return "unknown"
 
 
+def _classify_list_kinds(items: list[Any], max_items: int = 256) -> str:
+    if not items:
+        return str(PrimitiveKind.EMPTY_LIST)
+    kinds = sorted({str(classify_scalar(item)) for item in items[:max_items]})
+    return f"list[{'|'.join(kinds)}]"
+
+
 def _collect_extra_paths(
     model_cls: type[BaseModel],
     payload: Any,
@@ -220,14 +230,21 @@ def _collect_extra_paths(
                     sub_path = (*current_path, str(sub_key))
                     if isinstance(sub_val, dict):
                         for leaf_key, leaf_val in sub_val.items():
-                            extras.append(
-                                (
-                                    (*sub_path, str(leaf_key)),
-                                    str(classify_scalar(leaf_val)),
-                                )
+                            leaf_kind = (
+                                _classify_list_kinds(leaf_val)
+                                if isinstance(leaf_val, list)
+                                else str(classify_scalar(leaf_val))
                             )
+                            extras.append(((*sub_path, str(leaf_key)), leaf_kind))
                     else:
-                        extras.append((sub_path, str(classify_scalar(sub_val))))
+                        sub_kind = (
+                            _classify_list_kinds(sub_val)
+                            if isinstance(sub_val, list)
+                            else str(classify_scalar(sub_val))
+                        )
+                        extras.append((sub_path, sub_kind))
+            elif isinstance(val, list):
+                extras.append((current_path, _classify_list_kinds(val)))
             else:
                 extras.append((current_path, str(classify_scalar(val))))
         else:
@@ -349,7 +366,9 @@ def _type_compatible(expected_type: str, observed_kind: str) -> bool:
             PrimitiveKind.BOOL_STR,
         )
     if "list" in exp:
-        return observed_kind == PrimitiveKind.EMPTY_LIST or observed_kind.startswith("[")
+        return observed_kind == PrimitiveKind.EMPTY_LIST or observed_kind.startswith(
+            "list["
+        )
     return True
 
 
@@ -425,6 +444,7 @@ def _classify_validation_error(err: Any, observed_val: Any) -> DriftKind:
 def detect_drift(
     expected_model: type[BaseModel],
     raw_json: str | bytes | dict[str, Any],
+    mapping_provider: SchemaMappingProvider | None = None,
 ) -> DriftReport:
     start_ns = time.perf_counter_ns()
 
@@ -465,29 +485,34 @@ def detect_drift(
             loc_tuple: tuple[str | int, ...] = tuple(
                 int(x) if isinstance(x, int) else str(x) for x in err.get("loc", ())
             )
-            found, observed_val = _lookup_path(parsed, loc_tuple)
+            first_int_idx = next(
+                (i for i, seg in enumerate(loc_tuple) if isinstance(seg, int)),
+                None,
+            )
+            field_loc = (
+                loc_tuple[:first_int_idx]
+                if first_int_idx is not None and first_int_idx > 0
+                else loc_tuple
+            )
+            found, observed_val = _lookup_path(parsed, field_loc)
             kind = _classify_validation_error(err, observed_val if found else None)
-            expected_type = _resolve_expected_type(expected_model, loc_tuple)
+            expected_type = _resolve_expected_type(expected_model, field_loc)
             if not found:
                 obs_kind_str = "missing"
             elif isinstance(observed_val, list):
-                if observed_val:
-                    elem_kind = classify_scalar(observed_val[0])
-                    obs_kind_str = f"list[{elem_kind}]"
-                else:
-                    obs_kind_str = str(PrimitiveKind.EMPTY_LIST)
+                obs_kind_str = _classify_list_kinds(observed_val)
             elif isinstance(observed_val, dict):
                 obs_kind_str = "object"
             else:
                 obs_kind_str = str(classify_scalar(observed_val))
 
-            key = (kind, loc_tuple)
+            key = (kind, field_loc)
             if key not in seen_paths:
                 seen_paths.add(key)
                 raw_issues.append(
                     DriftIssue(
                         kind=kind,
-                        path=loc_tuple,
+                        path=field_loc,
                         expected_type=expected_type,
                         observed_kind=obs_kind_str,
                     )
@@ -495,6 +520,7 @@ def detect_drift(
 
     used_candidates: set[tuple[str | int, ...]] = set()
     enriched_issues: list[DriftIssue] = []
+    unmatched_missing_indices: list[int] = []
 
     for issue in raw_issues:
         if issue.kind == DriftKind.MISSING_FIELD and extra_candidates:
@@ -521,13 +547,58 @@ def detect_drift(
                     )
                 )
                 continue
+            unmatched_missing_indices.append(len(enriched_issues))
         enriched_issues.append(issue)
 
+    if (
+        mapping_provider is not None
+        and unmatched_missing_indices
+        and extra_candidates
+    ):
+        from sentinel.llm_fallback import sanitize_candidate_paths
+
+        unused_cands = [
+            (p, k) for p, k in extra_candidates if p not in used_candidates
+        ]
+        sanitized_map = sanitize_candidate_paths(unused_cands)
+        if sanitized_map:
+            missing_req: dict[str, str] = {}
+            idx_by_key: dict[str, int] = {}
+            for idx in unmatched_missing_indices:
+                m_issue = enriched_issues[idx]
+                dot_key = ".".join(str(seg) for seg in m_issue.path)
+                missing_req[dot_key] = m_issue.expected_type
+                idx_by_key[dot_key] = idx
+            extra_kinds = {k: v[1] for k, v in sanitized_map.items()}
+            llm_matches = mapping_provider.resolve_opaque_mappings(
+                expected_model.__name__, missing_req, extra_kinds
+            )
+            valid_paths_by_tuple = {p: k for p, k in unused_cands}
+            for dot_key, cand_tuple in llm_matches.items():
+                if dot_key not in idx_by_key or cand_tuple in used_candidates:
+                    continue
+                if cand_tuple not in valid_paths_by_tuple:
+                    continue
+                target_idx = idx_by_key[dot_key]
+                target_issue = enriched_issues[target_idx]
+                if not _type_compatible(
+                    target_issue.expected_type, valid_paths_by_tuple[cand_tuple]
+                ):
+                    continue
+                used_candidates.add(cand_tuple)
+                enriched_issues[target_idx] = DriftIssue(
+                    kind=target_issue.kind,
+                    path=target_issue.path,
+                    expected_type=target_issue.expected_type,
+                    observed_kind=target_issue.observed_kind,
+                    candidate_source_path=cand_tuple,
+                )
+
     for cand_path, cand_kind in extra_candidates:
-        top_Segment = cand_path[:1]
+        top_segment = cand_path[:1]
         if (DriftKind.EXTRA_FIELD, cand_path) not in seen_paths and (
             DriftKind.EXTRA_FIELD,
-            top_Segment,
+            top_segment,
         ) not in seen_paths:
             seen_paths.add((DriftKind.EXTRA_FIELD, cand_path))
             enriched_issues.append(

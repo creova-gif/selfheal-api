@@ -19,6 +19,9 @@ dev = [
     "ruff>=0.6",
 ]
 
+[project.scripts]
+selfheal = "selfheal_api.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
