@@ -163,3 +163,23 @@ def test_render_dashboard_html_blocks_javascript_pr_urls_and_shows_drift_rate() 
     assert 'href="javascript:alert(1)"' not in rendered
     assert 'href="https://github.com/acme/repo/pull/42"' in rendered
     assert "prefers-color-scheme: light" in rendered
+
+
+def test_render_dashboard_html_accessibility_and_export_links() -> None:
+    snapshot = DashboardSnapshot(
+        org_id="acme/prod",
+        plan="enterprise",
+        requests_per_minute_limit=1000,
+        llm_calls_limit=5000,
+        total_events=2,
+        drifted_events=1,
+        unique_fingerprints=1,
+        prs_opened=1,
+    )
+    rendered = render_dashboard_html(snapshot)
+    assert 'class="skip-link" href="#main-content"' in rendered
+    assert '<main id="main-content"' in rendered
+    assert '<th scope="col">Timestamp</th>' in rendered
+    assert ":focus-visible" in rendered
+    assert "/api/v1/events/export?org_id=acme%2Fprod&amp;format=csv" in rendered
+    assert "/api/v1/events/export?org_id=acme%2Fprod&amp;format=jsonl" in rendered

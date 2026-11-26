@@ -105,6 +105,7 @@ class ServerConfig(BaseModel):
     include_zod_adapter: bool = True
     max_body_bytes: int = Field(default=1_048_576, ge=1024)
     db_path: str = ":memory:"
+    retention_days: int = Field(default=0, ge=0)
     model_specs: list[str] = Field(default_factory=list)
     slack_webhook_url: str = ""
     alert_webhook_url: str = ""
@@ -1036,6 +1037,8 @@ def create_server(
     )
     registry = TenantRegistry(resolved_config)
     ledger = DriftLedger(db_path=resolved_config.db_path)
+    if resolved_config.retention_days > 0:
+        ledger.prune_older_than(resolved_config.retention_days * 86400.0)
     billing_store = BillingStore(db_path=resolved_config.db_path)
     installation_registry = InstallationRegistry(db_path=resolved_config.db_path)
     return SelfHealHTTPServer(
@@ -1069,6 +1072,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     rpm_env = int(os.environ.get("SELFHEAL_MAX_RPM", "60"))
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
     db_path_env = os.environ.get("SELFHEAL_DB_PATH", "").strip() or ":memory:"
+    retention_env = int(os.environ.get("SELFHEAL_RETENTION_DAYS", "0"))
     models_env = _parse_model_specs(os.environ.get("SELFHEAL_MODELS", ""))
     slack_url_env = os.environ.get("SELFHEAL_SLACK_WEBHOOK_URL", "").strip()
     alert_url_env = os.environ.get("SELFHEAL_ALERT_WEBHOOK_URL", "").strip()
@@ -1082,6 +1086,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
         "max_requests_per_minute": rpm_env,
         "max_llm_calls_per_tenant": llm_cap_env,
         "db_path": db_path_env,
+        "retention_days": retention_env,
         "model_specs": models_env,
         "slack_webhook_url": slack_url_env,
         "alert_webhook_url": alert_url_env,

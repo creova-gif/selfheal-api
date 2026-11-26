@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import urllib.parse
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -90,6 +91,7 @@ def _render_event_row(event: dict[str, Any]) -> str:
 def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
     """Render a self-contained, responsive, XSS-safe HTML5 Drift Console page."""
     org_id = _esc(snapshot.org_id)
+    org_q = urllib.parse.quote(snapshot.org_id, safe="")
     plan = _esc(snapshot.plan)
     plan_slug = _esc(snapshot.plan.strip().lower().replace(" ", "-"))
     rpm_limit = _esc(snapshot.requests_per_minute_limit)
@@ -324,10 +326,48 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
       color: var(--muted);
       padding: 2rem 1rem;
     }}
+    .skip-link {{
+      position: absolute;
+      left: -9999px;
+      top: auto;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+    }}
+    .skip-link:focus {{
+      position: static;
+      width: auto;
+      height: auto;
+      display: inline-block;
+      margin: 0.5rem 1rem;
+      padding: 0.4rem 0.75rem;
+      background: var(--accent);
+      color: #ffffff;
+      border-radius: 6px;
+      text-decoration: none;
+    }}
+    :focus-visible {{
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }}
+    .action-link {{
+      display: inline-block;
+      padding: 0.3rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.8rem;
+      background: var(--surface);
+    }}
+    .action-link:hover {{
+      border-color: var(--accent);
+    }}
   </style>
 </head>
 <body>
-  <main class="container">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <main id="main-content" class="container">
     <header class="header">
       <div>
         <h1 class="title">SelfHealAPI Drift Console</h1>
@@ -337,6 +377,14 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
         </p>
       </div>
       <div class="header-meta">
+        <a
+          class="action-link"
+          href="/api/v1/events/export?org_id={org_q}&amp;format=csv"
+        >Export CSV</a>
+        <a
+          class="action-link"
+          href="/api/v1/events/export?org_id={org_q}&amp;format=jsonl"
+        >Export JSONL</a>
         <span class="badge badge-plan plan-{plan_slug}">Plan: {plan}</span>
       </div>
     </header>
@@ -374,12 +422,12 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
         <table>
           <thead>
             <tr>
-              <th>Timestamp</th>
-              <th>Model</th>
-              <th>Fingerprint</th>
-              <th>Status</th>
-              <th>Redacted Field Summary</th>
-              <th>PR</th>
+              <th scope="col">Timestamp</th>
+              <th scope="col">Model</th>
+              <th scope="col">Fingerprint</th>
+              <th scope="col">Status</th>
+              <th scope="col">Redacted Field Summary</th>
+              <th scope="col">PR</th>
             </tr>
           </thead>
           <tbody>

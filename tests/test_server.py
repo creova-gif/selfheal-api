@@ -19,6 +19,7 @@ import pytest
 from pydantic import BaseModel
 
 from selfheal_api.billing import PlanTier, SubscriptionState
+from selfheal_api.ledger import DriftLedger
 from selfheal_api.notifier import (
     CompositeAlertNotifier,
     SignedWebhookNotifier,
@@ -1318,6 +1319,46 @@ def test_server_wires_multi_channel_notifier_from_env(
         assert len(server.notifier._notifiers) == 2
         assert isinstance(server.notifier._notifiers[0], UrllibSlackNotifier)
         assert isinstance(server.notifier._notifiers[1], SignedWebhookNotifier)
+    finally:
+        server.drift_ledger.close()
+        server.billing_store.close()
+        server.installation_registry.close()
+        server.server_close()
+
+
+def test_server_startup_prunes_events_when_retention_days_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_file = tmp_path / "retention.db"
+    seed = DriftLedger(db_file)
+    try:
+        now = time.time()
+        seed.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-expired",
+            has_drift=True,
+            issue_count=1,
+            created_at=now - (10 * 86400.0),
+        )
+        seed.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-fresh",
+            has_drift=True,
+            issue_count=1,
+            created_at=now - 60.0,
+        )
+    finally:
+        seed.close()
+
+    monkeypatch.setenv("SELFHEAL_DB_PATH", str(db_file))
+    monkeypatch.setenv("SELFHEAL_RETENTION_DAYS", "7")
+    cfg = _load_config_from_env_and_file(None)
+    server = create_server(host="127.0.0.1", port=0, config=cfg)
+    try:
+        remaining = server.drift_ledger.list_events(org_id="acme")
+        assert [ev.fingerprint for ev in remaining] == ["fp-fresh"]
     finally:
         server.drift_ledger.close()
         server.billing_store.close()
