@@ -12,10 +12,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from selfheal_api.billing import BillingStore, handle_stripe_webhook
+from selfheal_api.dashboard import DashboardSnapshot, render_dashboard_html
 from selfheal_api.github_app import (
     InstallationRegistry,
     handle_github_webhook,
@@ -23,6 +25,8 @@ from selfheal_api.github_app import (
 from selfheal_api.github_app import (
     verify_webhook_signature as verify_webhook_signature,
 )
+from selfheal_api.ledger import DriftLedger
+from selfheal_api.notifier import AlertNotifier, DriftAlert
 from sentinel.detector import detect_drift
 from sentinel.guard import DriftDeduplicator, compute_drift_fingerprint
 from sentinel.llm_fallback import AnthropicSchemaMappingProvider
@@ -173,12 +177,16 @@ class SelfHealHTTPServer(ThreadingHTTPServer):
         model_registry: Mapping[str, type[BaseModel]],
         billing_store: BillingStore | None = None,
         installation_registry: InstallationRegistry | None = None,
+        drift_ledger: DriftLedger | None = None,
+        notifier: AlertNotifier | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
         self.model_registry: dict[str, type[BaseModel]] = dict(model_registry)
         self.billing_store = billing_store or BillingStore()
         self.installation_registry = installation_registry or InstallationRegistry()
+        self.drift_ledger = drift_ledger or DriftLedger()
+        self.notifier = notifier
         super().__init__(server_address, RequestHandlerClass)
 
 
@@ -204,8 +212,29 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, status: HTTPStatus, html_body: str) -> None:
+        body = html_body.encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query_org_id(self, query: dict[str, list[str]]) -> str:
+        org_vals = query.get("org_id")
+        if org_vals and org_vals[0].strip():
+            return org_vals[0].strip()
+        hdr = self.headers.get("X-SelfHeal-Org", "").strip()
+        return hdr or "default"
+
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0]
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        query = parse_qs(parsed_url.query)
         if path == "/healthz":
             self._send_json(
                 HTTPStatus.OK,
@@ -226,6 +255,41 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
+            return
+        if path == "/api/v1/events":
+            org_id = self._query_org_id(query)
+            events = self.server.drift_ledger.list_events(org_id=org_id, limit=50)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "org_id": org_id,
+                    "events": [ev.model_dump(mode="json") for ev in events],
+                },
+            )
+            return
+        if path == "/api/v1/summary":
+            org_id = self._query_org_id(query)
+            summary = self.server.drift_ledger.get_org_summary(org_id)
+            self._send_json(HTTPStatus.OK, summary.model_dump(mode="json"))
+            return
+        if path == "/dashboard":
+            org_id = self._query_org_id(query)
+            sub = self.server.billing_store.get_subscription(org_id)
+            limits = self.server.billing_store.get_limits(org_id)
+            summary = self.server.drift_ledger.get_org_summary(org_id)
+            events = self.server.drift_ledger.list_events(org_id=org_id, limit=15)
+            snap = DashboardSnapshot(
+                org_id=org_id,
+                plan=str(sub.plan),
+                requests_per_minute_limit=limits.max_requests_per_minute,
+                llm_calls_limit=limits.max_llm_calls,
+                total_events=summary.total_events,
+                drifted_events=summary.drifted_events,
+                unique_fingerprints=summary.unique_fingerprints,
+                prs_opened=summary.prs_opened,
+                recent_events=[ev.model_dump(mode="json") for ev in events],
+            )
+            self._send_html(HTTPStatus.OK, render_dashboard_html(snap))
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -400,6 +464,26 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         zod_adapter: str | None = None
         if include_zod and plan.actions:
             zod_adapter = synthesize_zod_preprocessor(plan)
+
+        issue_kinds = tuple(str(i.kind) for i in report.issues)
+        self.server.drift_ledger.record_event(
+            org_id=org_id_raw,
+            model_name=req.model,
+            fingerprint=fingerprint,
+            has_drift=report.has_drift,
+            issue_count=len(report.issues),
+            issue_kinds=issue_kinds,
+        )
+        if report.has_drift and is_new and self.server.notifier is not None:
+            self.server.notifier.notify(
+                DriftAlert(
+                    org_id=org_id_raw,
+                    model_name=req.model,
+                    fingerprint=fingerprint,
+                    issue_count=len(report.issues),
+                    issue_kinds=issue_kinds,
+                )
+            )
 
         _logger.info(
             "drift_webhook org_id=%s model=%s has_drift=%s fingerprint=%s deduplicated=%s",

@@ -419,3 +419,44 @@ def test_server_stripe_github_and_metrics_routes() -> None:
         assert m_json["subscriptions_active"] == 1
         assert m_json["installations_active"] == 1
         assert server.billing_store.get_subscription("org-stripe").plan == "pro"
+
+
+def test_server_ledger_notifier_api_and_dashboard() -> None:
+    from selfheal_api.notifier import MockAlertNotifier
+
+    notifier = MockAlertNotifier()
+    with _running_server(ServerConfig()) as (server, base_url):
+        server.notifier = notifier
+        body = json.dumps(
+            {"model": "OrderPayload", "payload": {"id": "o1", "amount_cents": 500}}
+        ).encode("utf-8")
+        status, _, resp = _http_request(
+            f"{base_url}/webhooks/drift",
+            method="POST",
+            body=body,
+            headers={"X-SelfHeal-Org": "org-dash"},
+        )
+        assert status == 200
+        assert resp["has_drift"] is True
+        assert len(notifier.alerts) == 1
+        assert notifier.alerts[0].org_id == "org-dash"
+
+        ev_status, _, ev_json = _http_request(
+            f"{base_url}/api/v1/events?org_id=org-dash"
+        )
+        assert ev_status == 200
+        assert len(ev_json["events"]) == 1
+        assert ev_json["events"][0]["model_name"] == "OrderPayload"
+
+        sum_status, _, sum_json = _http_request(
+            f"{base_url}/api/v1/summary?org_id=org-dash"
+        )
+        assert sum_status == 200
+        assert sum_json["drifted_events"] == 1
+
+        with urllib.request.urlopen(f"{base_url}/dashboard?org_id=org-dash") as d_resp:
+            html_text = d_resp.read().decode("utf-8")
+            assert d_resp.status == 200
+            assert "SelfHealAPI Drift Console" in html_text
+            assert "org-dash" in html_text
+            assert "OrderPayload" in html_text

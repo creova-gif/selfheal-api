@@ -16,3 +16,9 @@
 - [x] Implement `EXP-1`–`EXP-5` (`selfheal` CLI, zero-PII `AnthropicSchemaMappingProvider`, `@selfheal_guard` + `DriftDeduplicator`, nested/list synthesis, TypeScript/Zod emitter)
 - [x] Implement Hosted Multi-Tenant Webhook Server (`python -m selfheal_api.server`, `/webhooks/drift`, `/healthz`) and Cloud Run `Dockerfile`
 - [ ] Run first external design-partner or open-source release
+
+## Wave 4: Milestone 4 — Full Product Engineering & Scope Expansion
+- [x] Persistent SQLite zero-PII Drift Event Ledger (`src/selfheal_api/ledger.py`)
+- [x] Zero-PII Slack / Webhook Alert Notifier (`src/selfheal_api/notifier.py`)
+- [x] OpenAPI 3.1 Schema Diff & `x-selfheal-aliases` Emitter (`src/synthesizer/openapi_emitter.py`)
+- [x] Self-contained XSS-safe Drift Console UI (`src/selfheal_api/dashboard.py`, `GET /dashboard`) & Ledger API (`GET /api/v1/events`, `GET /api/v1/summary`)
