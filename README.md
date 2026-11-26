@@ -1,20 +1,54 @@
 # SelfHealAPI: Self-Maintaining APIs & Autonomous Schema-Drift Engine
 
-SelfHealAPI detects third-party API payload drift at the system boundary, redacts all scalar values into structural primitives before analysis, and synthesizes `libcst` adapter patches that pass strict sandbox verification (`mypy --strict` and `pytest`) before a pull request is opened.
+[![CI](https://github.com/creova-gif/selfheal-api/actions/workflows/ci.yml/badge.svg)](https://github.com/creova-gif/selfheal-api/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-informational.svg)](CHANGELOG.md)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
-- **Spec and GTM doc:** [SelfHealAPI: Self-Maintaining APIs & Autonomous Schema-Drift Engine](https://docs.google.com/document/d/11etng86w_E0jCCEJ3lLjUW7L4yODKeIf4-yIe7J0EbY/edit?usp=drivesdk&ouid=110227624285917376281)
-- **Portfolio strategy:** [Startup & Open-Source Cross-Project Strategy](https://docs.google.com/document/d/12Wpg5mMGnjnl2uhMBTOR0QqRzQj8kwfzTLpvLoRuB5Q/edit?usp=drivesdk&ouid=110227624285917376281)
-- **Architecture and threat model:** See `AGENTS.md`, `docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md`, and `docs/THREAT_MODEL.md`.
+SelfHealAPI detects third-party API payload drift at the system boundary, redacts all scalar values into structural primitives before analysis, and synthesizes `libcst` adapter patches that pass strict sandbox verification (`verify_patch`, `mypy --strict`, and `pytest`) before a pull request is opened.
 
-## Architecture
+```mermaid
+flowchart LR
+    Payload["Incoming JSON Payload"] --> Sentinel["Sentinel (detect_drift / Zero-PII)"]
+    Sentinel --> Synthesizer["Synthesizer (libcst / Zod / OpenAPI 3.1)"]
+    Synthesizer --> Gate["Sandbox Gate (verify_patch, mypy --strict, pytest)"]
+    Gate --> Outputs["PR / Guard / Hosted Server"]
+```
 
-1. **Sentinel (`src/sentinel/detector.py`)**: Validates incoming JSON payloads against Pydantic v2 models (`strict=True`), classifies every scalar into a zero-PII `PrimitiveKind` (`<str>`, `<int>`, `<int_str>`, `<float_str>`, `<bool_str>`, `<iso_datetime>`, `<null>`), and emits an immutable `DriftReport` with matched candidate source paths for renamed or nested fields.
-2. **Synthesizer (`src/synthesizer/patcher.py`)**: Transforms a `DriftReport` into a `PatchPlan` and applies a `libcst.CSTTransformer` to inject a typed `@model_validator(mode='before')` normalization method and safe union/literal widening without losing formatting.
-3. **Verification gate (`verify_patch`)**: Parses the patched CST, executes the model in an isolated namespace, validates the drifted payload and canonical legacy payload with `strict=True`, and verifies `mypy --strict` compliance.
+## Overview
 
-## Quickstart
+Modern integrations break silently when upstream webhooks or REST APIs rename fields, coerce integers to strings, wrap scalars in lists, or nest properties. SelfHealAPI closes the loop between runtime detection and verified code remediation while enforcing a **Zero-PII boundary**:
 
-Run the linter, strict type checker, and test suite in Python 3.12:
+1. **Sentinel (`src/sentinel/detector.py`)**: Validates incoming JSON payloads against Pydantic v2 models (`strict=True`), classifies every scalar into a zero-PII `PrimitiveKind` (`<str>`, `<int>`, `<int_str>`, `<float_str>`, `<bool_str>`, `<iso_datetime>`, `<null>`), and emits an immutable `DriftReport` with matched candidate source paths.
+2. **Synthesizer (`src/synthesizer/patcher.py`)**: Transforms a `DriftReport` into a `PatchPlan` and applies a `libcst.CSTTransformer` to inject a typed `@model_validator(mode="before")` normalizer and safe union/literal widening without losing formatting.
+3. **Sandbox Gate (`verify_patch`)**: Parses the patched CST, executes the model in an isolated namespace, validates both the drifted payload and canonical legacy payload with `strict=True`, and enforces `mypy --strict` + `pytest` before any patch is written or PR is opened.
+
+- **Architecture & Threat Model:** See [`AGENTS.md`](AGENTS.md), [`docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md`](docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md), and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
+
+## Features
+
+- **Zero-PII Scalar Redaction:** Raw payload values never leave your boundary for LLM fallback (`AnthropicSchemaMappingProvider`) or persistent storage (`DriftEventLedger`).
+- **Formatting-Preserving `libcst` Patching:** Generates typed Pydantic v2 `@model_validator(mode="before")` adapters, nested sub-model normalizers, and list/scalar coercions.
+- **Fail-Closed Verification Gate:** Every patch must pass `verify_patch`, `mypy --strict --shadow-file`, and `pytest` before disk write or PR creation.
+- **Multi-Target Emitters:** Emit TypeScript Zod preprocessors (`--zod`) and OpenAPI 3.1 `x-selfheal-aliases` / `x-selfheal-coercions` schemas (`--openapi`).
+- **Runtime Guard & Middleware:** Drop-in `@selfheal_guard` decorator (sync/async) plus zero-dependency `SelfHealASGIMiddleware` and `SelfHealWSGIMiddleware`.
+- **Hosted Multi-Tenant Server & Drift Console:** Cloud Run-ready HTTP server with HMAC webhook verification, SQLite WAL event ledger, Slack/webhook alerting, and an XSS-safe HTML5 Drift Console (`GET /dashboard`).
+- **Replay Regression Harness:** Deterministic `run_replay_corpus` verification over recorded redacted samples.
+
+## Installation
+
+Requires **Python 3.12+**:
+
+```bash
+git clone https://github.com/creova-gif/selfheal-api.git
+cd selfheal-api
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Run the quality gates locally:
 
 ```bash
 .venv/bin/ruff check src tests
@@ -22,22 +56,23 @@ Run the linter, strict type checker, and test suite in Python 3.12:
 .venv/bin/pytest -v
 ```
 
-## `selfheal` CLI
+## Usage
 
-Install the package (`pip install -e .`) to use the `selfheal` CLI:
+### `selfheal` CLI (`check` & `heal`)
 
 ```bash
 # Detect schema drift and emit zero-PII DriftReport JSON (exit 0=clean, 1=drift, 2=error)
 selfheal check --model path/to/models.py:Invoice --payload drifted.json
 
 # Synthesize a libcst patch, run verify_patch + mypy --strict --shadow-file + pytest,
-# preview the unified diff, emit a TypeScript Zod adapter, write the patch, and open a PR
+# preview the unified diff, emit TypeScript Zod & OpenAPI 3.1 outputs, write, and open a PR
 selfheal heal \
   --model path/to/models.py:Invoice \
   --payload drifted.json \
   --canonical canonical.json \
   --diff \
   --zod generated/invoice_adapter.ts \
+  --openapi generated/openapi.json \
   --write \
   --open-pr
 ```
@@ -47,9 +82,9 @@ Useful `heal` flags:
 - `--pytest-args "..."`: pass extra arguments to the `pytest` verification gate.
 - `--branch <name>`: override the auto-generated `selfheal/<model>-<fingerprint>` branch name.
 
-## Runtime Guard & Zero-PII LLM Fallback
+### Runtime Guard (`@selfheal_guard`)
 
-Decorate sync or async boundary handlers with `@selfheal_guard` to detect drift in-process, deduplicate identical drift fingerprints, and optionally normalize incoming payloads (`normalize=True`):
+Decorate sync or async boundary handlers to detect drift in-process, deduplicate identical drift fingerprints, and optionally normalize incoming payloads (`normalize=True`):
 
 ```python
 from sentinel.guard import DriftDeduplicator, selfheal_guard
@@ -69,20 +104,35 @@ async def handle_webhook(payload: dict[str, object]) -> Invoice:
     return Invoice.model_validate(payload)
 ```
 
-- **`DriftDeduplicator`**: Thread-safe LRU cache with single-flight in-progress coordination keyed by `compute_drift_fingerprint(report)`.
-- **`AnthropicSchemaMappingProvider(max_calls=...)`**: Sends only redacted `PrimitiveKind` schemas and field names (never raw scalar values), bounded by a per-instance `max_calls` budget.
+### ASGI & WSGI Middleware
 
-## TypeScript / Zod Adapter Emission
-
-Generate a typed TypeScript preprocessor alongside Python CST patches via `selfheal heal --zod <out.ts>` or programmatically with `synthesize_zod_preprocessor(plan)`:
+Inspect JSON request bodies at runtime without framework lock-in using `SelfHealASGIMiddleware` or `SelfHealWSGIMiddleware` with `RouteBinding`:
 
 ```python
-from synthesizer.zod_emitter import synthesize_zod_preprocessor
+from selfheal_api import RouteBinding, SelfHealASGIMiddleware
 
-ts_source = synthesize_zod_preprocessor(patch_result.plan)
+app = SelfHealASGIMiddleware(
+    fastapi_or_starlette_app,
+    routes=[RouteBinding(path="/webhooks/invoice", model_cls=Invoice, normalize=True)],
+    on_drift=lambda report, fp: print(f"Route drift {fp[:8]}: {len(report.issues)} issues"),
+)
 ```
 
-The emitted module exports `normalize<ModelName>Drift(data: unknown)` and `createSelfHealZodAdapter<T extends z.ZodTypeAny>(schema: T)` (wrapping `z.preprocess(...)`):
+### Replay Regression Harness
+
+Validate a `PatchPlan` against a corpus of recorded samples using `run_replay_corpus`:
+
+```python
+from selfheal_api.replay import ReplaySample, run_replay_corpus
+
+samples = [ReplaySample(sample_id="stripe-v2", payload=drifted_payload)]
+report = run_replay_corpus(Invoice, samples, plan=patch_result.plan)
+assert report.failed == 0
+```
+
+### TypeScript / Zod Adapter Emission
+
+Generate a typed TypeScript preprocessor alongside Python CST patches via `selfheal heal --zod <out.ts>` or programmatically with `synthesize_zod_preprocessor(plan)`:
 
 ```ts
 import { z } from 'zod';
@@ -93,12 +143,14 @@ const InvoiceSchema = createSelfHealZodAdapter(
 );
 ```
 
-## Hosted Multi-Tenant Webhook Server
+### Hosted Multi-Tenant Server & Drift Console
 
-Run the hosted webhook receiver locally or deploy to GCP Cloud Run using the repository `Dockerfile`:
+Run the hosted webhook receiver locally or deploy to GCP Cloud Run using `Dockerfile` and [`deploy/cloudrun.yaml`](deploy/cloudrun.yaml):
 
 ```bash
 python -m selfheal_api.server
+# or via the installed console script:
+selfheal-server
 ```
 
 Endpoints:
@@ -107,18 +159,22 @@ Endpoints:
 - `GET /dashboard`: self-contained, XSS-safe HTML5 Drift Console displaying tenant quotas and recent redacted events.
 - `GET /api/v1/events` & `GET /api/v1/summary`: SQLite WAL zero-PII drift event ledger and aggregate telemetry APIs.
 
-## Milestone 4 & 5 Capabilities
+## Configuration
 
-- **Persistent Drift Ledger & Alerting:** `src/selfheal_api/ledger.py` records redacted drift metadata in SQLite WAL mode, while `src/selfheal_api/notifier.py` formats zero-PII Slack Block Kit and generic webhook alerts.
-- **OpenAPI 3.1 `x-selfheal-aliases` Export:** Export OpenAPI 3.1.0 `components.schemas` JSON with `x-selfheal-aliases` and `x-selfheal-coercions` directly from the CLI:
+The hosted server (`src/selfheal_api/server.py`), Cloud Run manifest (`deploy/cloudrun.yaml`), and LLM fallback provider (`src/sentinel/llm_fallback.py`) read the following environment variables:
 
-```bash
-selfheal heal --model app/models.py:Invoice --payload drifted.json --openapi openapi.json
-```
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `8080` | HTTP listen port for `selfheal-server` / Cloud Run. |
+| `SELFHEAL_HOST` | `0.0.0.0` | Bind host address for `selfheal-server`. |
+| `SELFHEAL_WEBHOOK_SECRET` | `""` | HMAC-SHA256 shared secret for `POST /webhooks/drift`. |
+| `STRIPE_WEBHOOK_SECRET` | `""` | Stripe webhook signing secret (falls back to `SELFHEAL_STRIPE_WEBHOOK_SECRET`). |
+| `GITHUB_APP_WEBHOOK_SECRET` | `""` | GitHub App webhook signing secret (falls back to `SELFHEAL_GITHUB_WEBHOOK_SECRET`). |
+| `SELFHEAL_MAX_RPM` | `60` | Per-tenant requests-per-minute rate limit. |
+| `SELFHEAL_MAX_LLM_CALLS` | `20` | Per-tenant cap on zero-PII LLM fallback calls. |
+| `ANTHROPIC_API_KEY` | `""` | API key for `AnthropicSchemaMappingProvider` when `--llm-fallback` is enabled. |
 
-- **Zero-Dependency ASGI/WSGI Middleware & Remediation Pipeline:** Drop-in `SelfHealASGIMiddleware` and `SelfHealWSGIMiddleware` inspect JSON payloads at runtime without framework lock-in, paired with a fail-closed `RemediationPipeline` that gates every synthesized patch through `verify_patch`, `mypy --strict`, and `pytest`.
-
-## Reproducible benchmark numbers
+## Benchmarks
 
 Measured on Python 3.12.12 (`pydantic 2.14.4`, `libcst 1.9.0`) across the 40-mutation benchmark suite simulating Stripe, HubSpot, and Weather API drift (`tests/test_drift_and_patch.py`):
 
@@ -152,3 +208,11 @@ passed = sum(1 for _, m, src, can, mut in ALL_40_MUTATIONS if verify_patch(synth
 print(f'Recall: {detected}/{len(ALL_40_MUTATIONS)} | Pass: {passed}/{len(ALL_40_MUTATIONS)} | Median: {statistics.median(medians):.3f}ms | p99: {statistics.median(p99s):.3f}ms')
 "
 ```
+
+## Contributing
+
+Contributions are welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, quality gates (`ruff`, `mypy --strict`, `pytest`), ADR guidelines, and Zero-PII security requirements.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

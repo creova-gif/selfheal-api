@@ -15,11 +15,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from selfheal_api.replay import load_jsonl_samples, run_replay_corpus
 from sentinel.detector import detect_drift
 from sentinel.guard import compute_drift_fingerprint
 from sentinel.llm_fallback import AnthropicSchemaMappingProvider, SchemaMappingProvider
 from synthesizer.openapi_emitter import emit_openapi_document, emit_openapi_schema_patch
-from synthesizer.patcher import synthesize_patch, verify_patch
+from synthesizer.patcher import PatchPlan, build_patch_plan, synthesize_patch, verify_patch
 from synthesizer.zod_emitter import synthesize_zod_preprocessor
 
 
@@ -261,12 +262,51 @@ def build_parser() -> argparse.ArgumentParser:
     heal_p.add_argument(
         "--branch", default=None, help="Target branch name for --open-pr"
     )
+
+    replay_p = sub.add_parser(
+        "replay",
+        help="Replay a JSONL corpus of recorded payloads against a Pydantic model",
+    )
+    replay_p.add_argument(
+        "--model", required=True, help="Target model as <path/to/file.py:ClassName>"
+    )
+    replay_p.add_argument(
+        "--corpus",
+        required=True,
+        help="Path to JSONL corpus of ReplaySample records",
+    )
+    replay_p.add_argument(
+        "--payload",
+        default=None,
+        help="Optional drifted payload JSON to synthesize a PatchPlan for replay",
+    )
     return parser
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    try:
+        _, model_cls = _load_model_from_spec(args.model)
+        samples = load_jsonl_samples(args.corpus)
+        plan: PatchPlan | None = None
+        if args.payload is not None:
+            drifted_payload = _load_json_file(args.payload)
+            drift_report = detect_drift(model_cls, drifted_payload)
+            plan = build_patch_plan(drift_report, root_model=model_cls)
+    except (FileNotFoundError, ValueError, ImportError, json.JSONDecodeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    report = run_replay_corpus(model_cls, samples, plan=plan)
+    print(report.model_dump_json(indent=2))
+    return 0 if report.failed == 0 else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "replay":
+        return _cmd_replay(args)
 
     try:
         model_path, model_cls = _load_model_from_spec(args.model)

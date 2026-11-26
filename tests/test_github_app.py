@@ -271,3 +271,40 @@ def test_urllib_github_app_client_protocol_and_validation() -> None:
             head="h",
             base="main",
         )
+
+
+def test_urllib_github_app_client_https_enforcement_and_slug_validation() -> None:
+    with pytest.raises(ValueError, match="https://"):
+        UrllibGitHubAppClient(token="ghs_test", api_base_url="http://api.github.com")
+
+    with pytest.raises(ValueError, match="http://"):
+        UrllibGitHubAppClient(
+            token="ghs_test",
+            api_base_url="ftp://api.github.com",
+            allow_insecure_http=True,
+        )
+
+    insecure_client = UrllibGitHubAppClient(
+        token="ghs_test",
+        api_base_url="http://localhost:8080",
+        allow_insecure_http=True,
+    )
+    assert isinstance(insecure_client, GitHubAppClient)
+
+    for bad_slug in ("", "..", "org/sub", "org\\sub", "bad slug", "org?x=1", "a..b"):
+        with pytest.raises(ValueError, match="Invalid owner"):
+            insecure_client.open_pull_request(
+                owner=bad_slug,
+                repo="payments-api",
+                title="t",
+                head="h",
+                base="main",
+            )
+        with pytest.raises(ValueError, match="Invalid repo"):
+            insecure_client.open_pull_request(
+                owner="acme-corp",
+                repo=bad_slug,
+                title="t",
+                head="h",
+                base="main",
+            )

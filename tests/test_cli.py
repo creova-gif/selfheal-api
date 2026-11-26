@@ -372,3 +372,145 @@ def test_cli_heal_open_pr_rolls_back_openapi_on_failure_without_write(
     assert rc == 2
     assert model_file.read_text(encoding="utf-8") == MODEL_CODE
     assert not openapi_out.exists()
+
+
+def test_cli_replay_clean_corpus_returns_0(tmp_path: Path, capsys: Any) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    corpus = tmp_path / "clean.jsonl"
+    corpus.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_id": "s1", "payload": {"id": "p1", "amount": 100}}),
+                json.dumps({"sample_id": "s2", "payload": {"id": "p2", "amount": 200}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rc = main(["replay", "--model", f"{model_file}:PaymentEvent", "--corpus", str(corpus)])
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "model_name": "PaymentEvent",
+        "total": 2,
+        "passed": 2,
+        "failed": 0,
+        "drifted": 0,
+        "failures": [],
+    }
+
+
+def test_cli_replay_drifted_corpus_fails_without_payload_and_passes_with_payload(
+    tmp_path: Path, capsys: Any
+) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    corpus = tmp_path / "drifted.jsonl"
+    corpus.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_id": "s1", "payload": {"id": "p1", "amount": 100}}),
+                json.dumps(
+                    {"sample_id": "s2", "payload": {"id": "p2", "amount_cents": "250"}}
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rc_fail = main(
+        ["replay", "--model", f"{model_file}:PaymentEvent", "--corpus", str(corpus)]
+    )
+    assert rc_fail == 1
+    fail_report = json.loads(capsys.readouterr().out)
+    assert fail_report["total"] == 2
+    assert fail_report["passed"] == 1
+    assert fail_report["failed"] == 1
+    assert fail_report["drifted"] == 1
+    assert len(fail_report["failures"]) == 1
+
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p2", "amount_cents": "250"}), encoding="utf-8"
+    )
+    rc_pass = main(
+        [
+            "replay",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--corpus",
+            str(corpus),
+            "--payload",
+            str(drifted_json),
+        ]
+    )
+    assert rc_pass == 0
+    pass_report = json.loads(capsys.readouterr().out)
+    assert pass_report["total"] == 2
+    assert pass_report["passed"] == 2
+    assert pass_report["failed"] == 0
+    assert pass_report["failures"] == []
+
+
+def test_cli_replay_missing_or_invalid_corpus_returns_2(tmp_path: Path) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+
+    missing_corpus = tmp_path / "missing.jsonl"
+    rc_missing = main(
+        [
+            "replay",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--corpus",
+            str(missing_corpus),
+        ]
+    )
+    assert rc_missing == 2
+
+    invalid_json_corpus = tmp_path / "invalid.jsonl"
+    invalid_json_corpus.write_text("{not-json\n", encoding="utf-8")
+    rc_invalid_json = main(
+        [
+            "replay",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--corpus",
+            str(invalid_json_corpus),
+        ]
+    )
+    assert rc_invalid_json == 2
+
+    invalid_sample_corpus = tmp_path / "invalid_sample.jsonl"
+    invalid_sample_corpus.write_text(json.dumps({"wrong": 1}) + "\n", encoding="utf-8")
+    rc_invalid_sample = main(
+        [
+            "replay",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--corpus",
+            str(invalid_sample_corpus),
+        ]
+    )
+    assert rc_invalid_sample == 2
+
+    valid_corpus = tmp_path / "valid.jsonl"
+    valid_corpus.write_text(
+        json.dumps({"sample_id": "s1", "payload": {"id": "p1", "amount": 100}}) + "\n",
+        encoding="utf-8",
+    )
+    rc_missing_payload = main(
+        [
+            "replay",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--corpus",
+            str(valid_corpus),
+            "--payload",
+            str(tmp_path / "missing_payload.json"),
+        ]
+    )
+    assert rc_missing_payload == 2

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import importlib
 import json
 import logging
 import os
@@ -114,6 +115,16 @@ class TokenBucketRateLimiter:
                 self._tokens -= 1.0
                 return True
             return False
+
+    def update_limit(self, max_requests_per_minute: int) -> None:
+        if max_requests_per_minute < 1:
+            raise ValueError("max_requests_per_minute must be >= 1")
+        with self._lock:
+            new_capacity = float(max_requests_per_minute)
+            if new_capacity != self._capacity:
+                self._capacity = new_capacity
+                self._refill_rate = max_requests_per_minute / 60.0
+                self._tokens = min(self._tokens, self._capacity)
 
 
 class TenantState:
@@ -452,6 +463,12 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if org_id_raw in self.server.billing_store.list_org_ids():
+            limits = self.server.billing_store.get_limits(org_id_raw)
+            tenant.rate_limiter.update_limit(limits.max_requests_per_minute)
+            if tenant.mapping_provider is not None:
+                tenant.mapping_provider.set_max_calls(limits.max_llm_calls)
+
         if not tenant.rate_limiter.allow():
             self._send_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -613,6 +630,34 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     return ServerConfig(**opts)
 
 
+def _load_model_registry(specs: list[str]) -> dict[str, type[BaseModel]]:
+    """Import ``module.path:ClassName`` specs and validate each is a Pydantic BaseModel."""
+    registry: dict[str, type[BaseModel]] = {}
+    for raw_spec in specs:
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        if ":" not in spec:
+            raise ValueError(
+                f"Invalid model spec {spec!r}; expected 'module.path:ClassName'"
+            )
+        module_path, class_name = spec.split(":", 1)
+        module_path = module_path.strip()
+        class_name = class_name.strip()
+        if not module_path or not class_name:
+            raise ValueError(
+                f"Invalid model spec {spec!r}; expected 'module.path:ClassName'"
+            )
+        module = importlib.import_module(module_path)
+        attr = getattr(module, class_name, None)
+        if attr is None:
+            raise ValueError(f"Model {class_name!r} not found in module {module_path!r}")
+        if not isinstance(attr, type) or not issubclass(attr, BaseModel):
+            raise ValueError(f"Model {spec!r} is not a Pydantic BaseModel subclass")
+        registry[class_name] = attr
+    return registry
+
+
 def main_server(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="selfheal-server",
@@ -625,6 +670,12 @@ def main_server(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", default=None, help="Optional path to JSON ServerConfig file"
     )
+    parser.add_argument(
+        "--models",
+        action="append",
+        default=None,
+        help="Model spec(s) 'module.path:ClassName' (or comma-separated via SELFHEAL_MODELS)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -635,7 +686,18 @@ def main_server(argv: list[str] | None = None) -> int:
     host = args.host if args.host is not None else config.host
     port = args.port if args.port is not None else config.port
 
-    server = create_server(host=host, port=port, config=config)
+    raw_models: list[str] = []
+    if args.models:
+        for item in args.models:
+            raw_models.extend(part.strip() for part in item.split(",") if part.strip())
+    else:
+        env_models = os.environ.get("SELFHEAL_MODELS", "")
+        raw_models = [part.strip() for part in env_models.split(",") if part.strip()]
+    model_registry = _load_model_registry(raw_models)
+
+    server = create_server(
+        host=host, port=port, config=config, model_registry=model_registry
+    )
     _logger.info("Starting selfheal-server on %s:%d", host, port)
     try:
         server.serve_forever()

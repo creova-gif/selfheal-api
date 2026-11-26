@@ -119,6 +119,12 @@ class AnthropicSchemaMappingProvider:
         self._calls_made = 0
         self._lock = threading.Lock()
 
+    def set_max_calls(self, max_calls: int) -> None:
+        if max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
+        with self._lock:
+            self._max_calls = max_calls
+
     def resolve_opaque_mappings(
         self,
         model_name: str,

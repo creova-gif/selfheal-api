@@ -187,3 +187,21 @@ def test_org_summary_aggregation() -> None:
         )
     finally:
         ledger.close()
+
+
+def test_closed_ledger_raises_runtime_error_and_sets_busy_timeout() -> None:
+    ledger = DriftLedger(":memory:")
+    busy_timeout_row = ledger._conn.execute("PRAGMA busy_timeout").fetchone()
+    assert busy_timeout_row is not None
+    assert int(busy_timeout_row[0]) == 5000
+
+    ledger.close()
+
+    with pytest.raises(RuntimeError, match="DriftLedger is closed"):
+        ledger.record_event("org-1", "User", "fp-1", True, 1)
+
+    with pytest.raises(RuntimeError, match="DriftLedger is closed"):
+        ledger.list_events(org_id="org-1")
+
+    with pytest.raises(RuntimeError, match="DriftLedger is closed"):
+        ledger.get_org_summary("org-1")

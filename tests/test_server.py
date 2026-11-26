@@ -13,11 +13,14 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from selfheal_api.billing import PlanTier, SubscriptionState
 from selfheal_api.server import (
     SelfHealHTTPServer,
     ServerConfig,
     TenantConfig,
+    _load_model_registry,
     create_server,
+    main_server,
     verify_webhook_signature,
 )
 
@@ -500,3 +503,97 @@ def test_tenant_read_endpoints_require_auth_and_error_codes() -> None:
             headers={"X-SelfHeal-Org": "org-a", "X-Hub-Signature-256": os_sig},
         )
         assert ov_status == 413
+
+
+def test_load_model_registry_and_selfheal_models_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _load_model_registry(["selfheal_api.server:ServerConfig", "  "])
+    assert registry == {"ServerConfig": ServerConfig}
+
+    with pytest.raises(ValueError, match="Invalid model spec"):
+        _load_model_registry(["invalid_spec_without_colon"])
+
+    with pytest.raises(ValueError, match="not found"):
+        _load_model_registry(["selfheal_api.server:DoesNotExist"])
+
+    with pytest.raises(ValueError, match="not a Pydantic BaseModel"):
+        _load_model_registry(["selfheal_api.server:TenantRegistry"])
+
+    captured: dict[str, Any] = {}
+
+    class _DummyServer:
+        def serve_forever(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            captured["closed"] = True
+
+    def _fake_create_server(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _DummyServer()
+
+    monkeypatch.setenv(
+        "SELFHEAL_MODELS",
+        "selfheal_api.server:ServerConfig, selfheal_api.server:TenantConfig",
+    )
+    monkeypatch.setattr("selfheal_api.server.create_server", _fake_create_server)
+
+    exit_code = main_server(["--host", "127.0.0.1", "--port", "0"])
+    assert exit_code == 0
+    assert captured["model_registry"] == {
+        "ServerConfig": ServerConfig,
+        "TenantConfig": TenantConfig,
+    }
+    assert captured["closed"] is True
+
+    # --models CLI flag overrides SELFHEAL_MODELS
+    captured.clear()
+    exit_code_cli = main_server(
+        ["--host", "127.0.0.1", "--port", "0", "--models", "selfheal_api.server:ServerConfig"]
+    )
+    assert exit_code_cli == 0
+    assert captured["model_registry"] == {"ServerConfig": ServerConfig}
+
+
+def test_webhook_consults_billing_store_limits() -> None:
+    config = ServerConfig(
+        tenants={
+            "org-free": TenantConfig(
+                max_requests_per_minute=100,
+                max_llm_calls_per_tenant=50,
+                enable_llm_fallback=True,
+            ),
+        },
+        allow_unregistered_tenants=False,
+    )
+    body = json.dumps(
+        {
+            "model": "OrderPayload",
+            "payload": {
+                "order_id": 1,
+                "customer_email": "alice@example.com",
+                "total_cents": 100,
+            },
+        }
+    ).encode("utf-8")
+
+    with _running_server(config) as (server, base_url):
+        server.billing_store.upsert_subscription(
+            SubscriptionState(org_id="org-free", plan=PlanTier.FREE, status="active")
+        )
+        status, _, _ = _http_request(
+            f"{base_url}/webhooks/drift",
+            method="POST",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-SelfHeal-Org": "org-free",
+            },
+        )
+        assert status == 200
+        tenant = server.registry.get_tenant("org-free")
+        assert tenant is not None
+        assert tenant.rate_limiter._capacity == 30.0
+        assert tenant.mapping_provider is not None
+        assert tenant.mapping_provider._max_calls == 10

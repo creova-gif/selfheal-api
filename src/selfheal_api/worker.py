@@ -68,10 +68,12 @@ class RemediationQueue:
             maxsize=max_queue_size
         )
         self._seen_fingerprints: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._in_flight: set[tuple[str, str]] = set()
 
         self._lock = threading.Lock()
         self._drained_cond = threading.Condition(self._lock)
         self._thread: threading.Thread | None = None
+        self._stop_requested = False
 
         self._pending = 0
         self._enqueued = 0
@@ -86,6 +88,7 @@ class RemediationQueue:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            self._stop_requested = False
             self._thread = threading.Thread(
                 target=self._run_loop,
                 name="selfheal-remediation-worker",
@@ -96,6 +99,7 @@ class RemediationQueue:
     def stop(self, timeout: float = 5.0) -> None:
         """Signal the worker thread to stop and wait up to ``timeout`` seconds."""
         with self._lock:
+            self._stop_requested = True
             thread = self._thread
         if thread is None or not thread.is_alive():
             with self._lock:
@@ -103,11 +107,11 @@ class RemediationQueue:
             return
 
         try:
-            self._queue.put(_STOP_SENTINEL, timeout=timeout)
+            self._queue.put_nowait(_STOP_SENTINEL)
         except queue.Full:
-            logger.warning(
-                "RemediationQueue stop sentinel timed out after %.2fs; queue remains full",
-                timeout,
+            logger.debug(
+                "RemediationQueue stop sentinel dropped because queue is full; "
+                "worker will exit via stop flag"
             )
 
         thread.join(timeout=timeout)
@@ -119,10 +123,14 @@ class RemediationQueue:
         """Enqueue a remediation job non-blockingly with org+fingerprint deduplication."""
         dedup_id = (job.request.org_id, job.fingerprint)
         with self._lock:
-            if self._max_seen_fingerprints > 0 and dedup_id in self._seen_fingerprints:
-                self._seen_fingerprints.move_to_end(dedup_id)
-                self._deduplicated += 1
-                return False
+            if self._max_seen_fingerprints > 0:
+                if dedup_id in self._in_flight:
+                    self._deduplicated += 1
+                    return False
+                if dedup_id in self._seen_fingerprints:
+                    self._seen_fingerprints.move_to_end(dedup_id)
+                    self._deduplicated += 1
+                    return False
 
             try:
                 self._queue.put_nowait(job)
@@ -131,9 +139,7 @@ class RemediationQueue:
                 return False
 
             if self._max_seen_fingerprints > 0:
-                self._seen_fingerprints[dedup_id] = None
-                while len(self._seen_fingerprints) > self._max_seen_fingerprints:
-                    self._seen_fingerprints.popitem(last=False)
+                self._in_flight.add(dedup_id)
 
             self._enqueued += 1
             self._pending += 1
@@ -158,11 +164,18 @@ class RemediationQueue:
 
     def _run_loop(self) -> None:
         while True:
-            item = self._queue.get()
+            with self._lock:
+                if self._stop_requested:
+                    break
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if isinstance(item, _StopSentinel):
                 self._queue.task_done()
                 break
 
+            dedup_id = (item.request.org_id, item.fingerprint)
             succeeded = False
             try:
                 outcome = self._pipeline.run(
@@ -181,6 +194,13 @@ class RemediationQueue:
                 )
             finally:
                 with self._drained_cond:
+                    if self._max_seen_fingerprints > 0:
+                        self._in_flight.discard(dedup_id)
+                        if succeeded:
+                            self._seen_fingerprints[dedup_id] = None
+                            self._seen_fingerprints.move_to_end(dedup_id)
+                            while len(self._seen_fingerprints) > self._max_seen_fingerprints:
+                                self._seen_fingerprints.popitem(last=False)
                     self._processed += 1
                     if succeeded:
                         self._succeeded += 1

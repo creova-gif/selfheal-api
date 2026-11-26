@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import threading
+import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
@@ -353,8 +355,11 @@ class MockGitHubAppClient:
             return dict(pr)
 
 
+_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
 def _validate_slug(value: str, field_name: str) -> None:
-    if not value or "/" in value or "\\" in value or ".." in value:
+    if not _SLUG_RE.match(value) or ".." in value:
         raise ValueError(f"Invalid {field_name}: {value!r}")
 
 
@@ -366,9 +371,18 @@ class UrllibGitHubAppClient:
         token: str,
         api_base_url: str = "https://api.github.com",
         timeout_seconds: float = 10.0,
+        allow_insecure_http: bool = False,
     ) -> None:
         if not token:
             raise ValueError("token must be non-empty")
+        parsed = urllib.parse.urlparse(api_base_url)
+        if not allow_insecure_http:
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise ValueError(
+                    "api_base_url must use https:// (or set allow_insecure_http=True)"
+                )
+        elif parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("api_base_url must use http:// or https://")
         self._token = token
         self._api_base_url = api_base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds

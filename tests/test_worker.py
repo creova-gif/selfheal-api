@@ -150,6 +150,7 @@ def test_worker_deduplicates_org_and_fingerprint() -> None:
             worker.enqueue(_make_job(org_id="acme", repo="acme/orders", fingerprint="fp-new"))
             is True
         )
+        assert worker.wait_until_drained(timeout=5.0) is True
         # ("acme", "fp-dup") was evicted, so it can be enqueued again
         assert (
             worker.enqueue(_make_job(org_id="acme", repo="acme/orders", fingerprint="fp-dup"))
@@ -248,3 +249,78 @@ def test_worker_wait_until_drained_timeout_and_failure_counting() -> None:
     finally:
         gate.set()
         worker.stop(timeout=5.0)
+
+
+def test_worker_retries_after_transient_failure() -> None:
+    pipeline, github, _, _ = _build_pipeline()
+    original_run = pipeline.run
+    attempts = 0
+
+    def flaky_run(
+        req: RemediationRequest,
+        expected_model: type[BaseModel],
+        drifted_payload: dict[str, object],
+        canonical_payload: dict[str, object] | None = None,
+    ) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient network error")
+        return original_run(req, expected_model, drifted_payload, canonical_payload)
+
+    pipeline.run = flaky_run  # type: ignore[method-assign,assignment]
+
+    worker = RemediationQueue(pipeline)
+    worker.start()
+    try:
+        # First attempt fails transiently
+        assert worker.enqueue(_make_job(fingerprint="fp-retry")) is True
+        assert worker.wait_until_drained(timeout=5.0) is True
+        assert worker.stats().failed == 1
+        assert worker.stats().succeeded == 0
+
+        # Retry with same org+fingerprint is allowed and succeeds
+        assert worker.enqueue(_make_job(fingerprint="fp-retry")) is True
+        assert worker.wait_until_drained(timeout=5.0) is True
+        stats = worker.stats()
+        assert stats.enqueued == 2
+        assert stats.processed == 2
+        assert stats.failed == 1
+        assert stats.succeeded == 1
+        assert len(github.opened_prs) == 1
+
+        # Subsequent duplicate after success is deduplicated
+        assert worker.enqueue(_make_job(fingerprint="fp-retry")) is False
+        assert worker.stats().deduplicated == 1
+    finally:
+        worker.stop(timeout=5.0)
+
+
+def test_worker_stop_unblocks_when_queue_full() -> None:
+    pipeline, _, _, _ = _build_pipeline()
+    gate = threading.Event()
+    original_run = pipeline.run
+
+    def blocking_run(
+        req: RemediationRequest,
+        expected_model: type[BaseModel],
+        drifted_payload: dict[str, object],
+        canonical_payload: dict[str, object] | None = None,
+    ) -> object:
+        gate.wait(timeout=2.0)
+        return original_run(req, expected_model, drifted_payload, canonical_payload)
+
+    pipeline.run = blocking_run  # type: ignore[method-assign,assignment]
+
+    worker = RemediationQueue(pipeline, max_queue_size=1)
+    worker.start()
+    try:
+        assert worker.enqueue(_make_job(fingerprint="fp-block-1")) is True
+        # Enqueue a second job to fill the bounded queue while first is running
+        worker.enqueue(_make_job(fingerprint="fp-block-2"))
+        gate.set()
+        worker.stop(timeout=2.0)
+        assert worker._thread is None
+    finally:
+        gate.set()
+        worker.stop(timeout=2.0)

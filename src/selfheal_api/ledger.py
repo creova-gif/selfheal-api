@@ -53,6 +53,7 @@ class DriftLedger:
 
     def _initialize_schema(self) -> None:
         with self._lock:
+            self._conn.execute("PRAGMA busy_timeout=5000;")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(
                 """
@@ -94,6 +95,8 @@ class DriftLedger:
         kinds_json = json.dumps(list(kinds_tuple))
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError("DriftLedger is closed")
             cursor = self._conn.execute(
                 """
                 INSERT INTO drift_events (
@@ -175,6 +178,8 @@ class DriftLedger:
         """
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError("DriftLedger is closed")
             rows = self._conn.execute(query, params).fetchall()
 
         return [
@@ -195,6 +200,8 @@ class DriftLedger:
     def get_org_summary(self, org_id: str) -> OrgDriftSummary:
         """Compute aggregated drift statistics for a single organization."""
         with self._lock:
+            if self._closed:
+                raise RuntimeError("DriftLedger is closed")
             agg_row = self._conn.execute(
                 """
                 SELECT
