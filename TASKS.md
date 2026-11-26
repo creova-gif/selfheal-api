@@ -22,3 +22,8 @@
 - [x] Zero-PII Slack / Webhook Alert Notifier (`src/selfheal_api/notifier.py`)
 - [x] OpenAPI 3.1 Schema Diff & `x-selfheal-aliases` Emitter (`src/synthesizer/openapi_emitter.py`)
 - [x] Self-contained XSS-safe Drift Console UI (`src/selfheal_api/dashboard.py`, `GET /dashboard`) & Ledger API (`GET /api/v1/events`, `GET /api/v1/summary`)
+
+## Wave 5: Milestone 5 — Middleware, Auto-Remediation & OpenAPI CLI
+- [x] Zero-dependency ASGI/WSGI schema-drift middleware (`SelfHealASGIMiddleware`, `SelfHealWSGIMiddleware`)
+- [x] Fail-closed `RemediationPipeline` orchestrating detection, CST synthesis, verification gates, and rollback
+- [x] `--openapi` CLI flag on `selfheal heal` emitting OpenAPI 3.1.0 `components.schemas` JSON with `x-selfheal-aliases` and rollback cleanup

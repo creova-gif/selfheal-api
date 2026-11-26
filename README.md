@@ -104,6 +104,19 @@ python -m selfheal_api.server
 Endpoints:
 - `GET /healthz`: liveness/readiness health check.
 - `POST /webhooks/drift`: multi-tenant drift ingestion and automated patch/PR dispatch endpoint.
+- `GET /dashboard`: self-contained, XSS-safe HTML5 Drift Console displaying tenant quotas and recent redacted events.
+- `GET /api/v1/events` & `GET /api/v1/summary`: SQLite WAL zero-PII drift event ledger and aggregate telemetry APIs.
+
+## Milestone 4 & 5 Capabilities
+
+- **Persistent Drift Ledger & Alerting:** `src/selfheal_api/ledger.py` records redacted drift metadata in SQLite WAL mode, while `src/selfheal_api/notifier.py` formats zero-PII Slack Block Kit and generic webhook alerts.
+- **OpenAPI 3.1 `x-selfheal-aliases` Export:** Export OpenAPI 3.1.0 `components.schemas` JSON with `x-selfheal-aliases` and `x-selfheal-coercions` directly from the CLI:
+
+```bash
+selfheal heal --model app/models.py:Invoice --payload drifted.json --openapi openapi.json
+```
+
+- **Zero-Dependency ASGI/WSGI Middleware & Remediation Pipeline:** Drop-in `SelfHealASGIMiddleware` and `SelfHealWSGIMiddleware` inspect JSON payloads at runtime without framework lock-in, paired with a fail-closed `RemediationPipeline` that gates every synthesized patch through `verify_patch`, `mypy --strict`, and `pytest`.
 
 ## Reproducible benchmark numbers
 

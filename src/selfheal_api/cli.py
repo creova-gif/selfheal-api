@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sentinel.detector import detect_drift
 from sentinel.guard import compute_drift_fingerprint
 from sentinel.llm_fallback import AnthropicSchemaMappingProvider, SchemaMappingProvider
+from synthesizer.openapi_emitter import emit_openapi_document, emit_openapi_schema_patch
 from synthesizer.patcher import synthesize_patch, verify_patch
 from synthesizer.zod_emitter import synthesize_zod_preprocessor
 
@@ -129,10 +130,13 @@ def _open_github_pr(
     branch_name: str,
     model_name: str,
     fingerprint: str,
+    openapi_path: Path | None = None,
 ) -> None:
     files_to_commit = [str(model_path)]
     if zod_path is not None:
         files_to_commit.append(str(zod_path))
+    if openapi_path is not None:
+        files_to_commit.append(str(openapi_path))
 
     status_proc = subprocess.run(
         ["git", "status", "--porcelain", "--", *files_to_commit],
@@ -245,6 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--zod", default=None, help="Write TypeScript Zod preprocessor to output path"
     )
     heal_p.add_argument(
+        "--openapi",
+        default=None,
+        help="Optional output path for OpenAPI 3.1 components.schemas JSON",
+    )
+    heal_p.add_argument(
         "--open-pr",
         action="store_true",
         help="Create branch, commit verified patch, and open GitHub PR",
@@ -326,6 +335,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         zod_code = synthesize_zod_preprocessor(patch_result.plan)
         _atomic_write(zod_path, zod_code)
 
+    openapi_path: Path | None = None
+    openapi_existed = False
+    if args.openapi is not None:
+        openapi_path = Path(args.openapi)
+        openapi_existed = openapi_path.exists()
+        spec = emit_openapi_schema_patch(model_cls, patch_result.plan)
+        doc = emit_openapi_document([spec])
+        _atomic_write(openapi_path, json.dumps(doc, indent=2) + "\n")
+
     if args.open_pr:
         fp = compute_drift_fingerprint(report)
         branch = args.branch or f"selfheal/{model_cls.__name__.lower()}-{fp[:8]}"
@@ -346,7 +364,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             orig_branch = None
 
         try:
-            _open_github_pr(model_path, zod_path, branch, model_cls.__name__, fp)
+            _open_github_pr(
+                model_path,
+                zod_path,
+                branch,
+                model_cls.__name__,
+                fp,
+                openapi_path=openapi_path,
+            )
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
@@ -377,6 +402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _atomic_write(model_path, source_code)
                 if zod_path is not None and not zod_existed:
                     zod_path.unlink(missing_ok=True)
+                if openapi_path is not None and not openapi_existed:
+                    openapi_path.unlink(missing_ok=True)
             print(f"pr creation failed: {exc}", file=sys.stderr)
             return 2
 

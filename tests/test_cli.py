@@ -295,3 +295,80 @@ def test_cli_heal_open_pr_rolls_back_on_gh_failure_without_write(
     assert model_file.read_text(encoding="utf-8") == MODEL_CODE
     assert not zod_out.exists()
     assert ["git", "checkout", "main"] in recorded_cmds
+
+
+def test_cli_heal_openapi_writes_valid_openapi_31_with_aliases(tmp_path: Path) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": "250"}), encoding="utf-8"
+    )
+    openapi_out = tmp_path / "openapi.json"
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", return_value=(True, "1 passed")),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--openapi",
+                str(openapi_out),
+            ]
+        )
+
+    assert rc == 0
+    assert openapi_out.exists()
+    doc = json.loads(openapi_out.read_text(encoding="utf-8"))
+    assert doc["openapi"] == "3.1.0"
+    payment_schema = doc["components"]["schemas"]["PaymentEvent"]
+    assert payment_schema["x-selfheal-aliases"] == {"amount": ["amount_cents"]}
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+
+
+def test_cli_heal_open_pr_rolls_back_openapi_on_failure_without_write(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+    openapi_out = tmp_path / "openapi.json"
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd[:2] == ["git", "status"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M models.py\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="gh auth failed")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", return_value=(True, "1 passed")),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--openapi",
+                str(openapi_out),
+                "--open-pr",
+            ]
+        )
+
+    assert rc == 2
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+    assert not openapi_out.exists()
