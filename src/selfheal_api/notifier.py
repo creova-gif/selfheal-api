@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import threading
@@ -96,12 +97,31 @@ class MockAlertNotifier:
             return self._should_succeed
 
 
-def _validate_webhook_config(webhook_url: str, timeout_s: float) -> None:
+def _validate_webhook_config(
+    webhook_url: str, timeout_s: float, *, allow_private_urls: bool = False
+) -> None:
     parsed = urllib.parse.urlparse(webhook_url)
-    if parsed.scheme != "https" or not parsed.netloc:
+    if parsed.scheme != "https" or not parsed.netloc or not parsed.hostname:
         raise ValueError("webhook_url must be a valid https:// URL")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be > 0")
+    if not allow_private_urls:
+        host = parsed.hostname.strip().lower().rstrip(".")
+        if host == "localhost" or host.endswith((".local", ".internal")):
+            raise ValueError("webhook_url must not target localhost or internal hosts")
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            raise ValueError("webhook_url must not target private or link-local IP addresses")
 
 
 def _post_json(
@@ -137,8 +157,16 @@ def _post_json(
 class UrllibSlackNotifier:
     """Slack webhook notifier using stdlib urllib with fail-closed error handling."""
 
-    def __init__(self, webhook_url: str, *, timeout_s: float = 5.0) -> None:
-        _validate_webhook_config(webhook_url, timeout_s)
+    def __init__(
+        self,
+        webhook_url: str,
+        *,
+        timeout_s: float = 5.0,
+        allow_private_urls: bool = False,
+    ) -> None:
+        _validate_webhook_config(
+            webhook_url, timeout_s, allow_private_urls=allow_private_urls
+        )
         self._webhook_url = webhook_url
         self._timeout_s = timeout_s
 
@@ -164,8 +192,11 @@ class SignedWebhookNotifier:
         *,
         signing_secret: str = "",
         timeout_s: float = 5.0,
+        allow_private_urls: bool = False,
     ) -> None:
-        _validate_webhook_config(webhook_url, timeout_s)
+        _validate_webhook_config(
+            webhook_url, timeout_s, allow_private_urls=allow_private_urls
+        )
         self._webhook_url = webhook_url
         self._signing_secret = signing_secret
         self._timeout_s = timeout_s

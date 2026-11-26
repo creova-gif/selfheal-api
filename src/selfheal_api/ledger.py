@@ -275,6 +275,24 @@ class DriftLedger:
             "prs_opened": int(row[2]),
         }
 
+    def prune_older_than(
+        self, max_age_seconds: float, *, now: float | None = None
+    ) -> int:
+        """Delete drift events older than max_age_seconds and return deleted row count."""
+        if max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be > 0")
+        ref_now = time.time() if now is None else now
+        cutoff = ref_now - max_age_seconds
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DriftLedger is closed")
+            cursor = self._conn.execute(
+                "DELETE FROM drift_events WHERE created_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount)
+
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         with self._lock:

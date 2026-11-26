@@ -247,3 +247,22 @@ def test_composite_alert_notifier_fanout_and_isolation(
     )
     assert all_failing.notify(alert) is False
     assert CompositeAlertNotifier([]).notify(alert) is False
+
+
+def test_notifiers_reject_ssrf_private_and_metadata_urls() -> None:
+    blocked_urls = [
+        "https://169.254.169.254/latest/meta-data/",
+        "https://127.0.0.1/webhook",
+        "https://10.0.0.5/webhook",
+        "https://[::1]/webhook",
+        "https://localhost/webhook",
+        "https://metadata.internal/webhook",
+    ]
+    for bad_url in blocked_urls:
+        with pytest.raises(ValueError, match="must not target"):
+            UrllibSlackNotifier(bad_url)
+        with pytest.raises(ValueError, match="must not target"):
+            SignedWebhookNotifier(bad_url)
+
+    allowed = SignedWebhookNotifier("https://127.0.0.1/webhook", allow_private_urls=True)
+    assert allowed._webhook_url == "https://127.0.0.1/webhook"

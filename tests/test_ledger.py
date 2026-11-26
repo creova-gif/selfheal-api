@@ -290,3 +290,32 @@ def test_list_events_supports_offset_pagination_and_validation() -> None:
             ledger.list_events(org_id="acme", limit=2, offset=-1)
     finally:
         ledger.close()
+
+
+def test_prune_older_than_removes_expired_events_and_validates_age() -> None:
+    ledger = DriftLedger(":memory:")
+    try:
+        ledger.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-old",
+            has_drift=True,
+            issue_count=1,
+            created_at=100.0,
+        )
+        ledger.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-new",
+            has_drift=True,
+            issue_count=1,
+            created_at=950.0,
+        )
+        deleted = ledger.prune_older_than(100.0, now=1000.0)
+        assert deleted == 1
+        remaining = ledger.list_events(org_id="acme")
+        assert [ev.fingerprint for ev in remaining] == ["fp-new"]
+        with pytest.raises(ValueError, match="max_age_seconds must be > 0"):
+            ledger.prune_older_than(0.0)
+    finally:
+        ledger.close()
