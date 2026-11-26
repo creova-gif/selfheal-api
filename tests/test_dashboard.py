@@ -129,3 +129,37 @@ def test_render_dashboard_html_escapes_xss_payloads() -> None:
     assert "&lt;script&gt;alert(&quot;model_xss&quot;)&lt;/script&gt;" in rendered
     assert "pro&quot; onclick=&quot;alert(1)" in rendered
     assert "&lt;img src=x onerror=&quot;alert(2)&quot;&gt;" in rendered
+
+
+def test_render_dashboard_html_blocks_javascript_pr_urls_and_shows_drift_rate() -> None:
+    snapshot = DashboardSnapshot(
+        org_id="org_sec",
+        plan="pro",
+        requests_per_minute_limit=120,
+        llm_calls_limit=200,
+        total_events=4,
+        drifted_events=1,
+        unique_fingerprints=1,
+        prs_opened=1,
+        recent_events=[
+            {
+                "timestamp": "2026-11-26T10:00:00Z",
+                "model_name": "Invoice",
+                "fingerprint": "fp_1",
+                "drifted": True,
+                "pr_url": "javascript:alert(1)",
+            },
+            {
+                "timestamp": "2026-11-26T10:01:00Z",
+                "model_name": "Invoice",
+                "fingerprint": "fp_2",
+                "drifted": False,
+                "pr_url": "https://github.com/acme/repo/pull/42",
+            },
+        ],
+    )
+    rendered = render_dashboard_html(snapshot)
+    assert "Drift Rate:<strong>25.0%</strong>" in rendered
+    assert 'href="javascript:alert(1)"' not in rendered
+    assert 'href="https://github.com/acme/repo/pull/42"' in rendered
+    assert "prefers-color-scheme: light" in rendered

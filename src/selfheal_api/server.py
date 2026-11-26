@@ -451,6 +451,33 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     {"status": "unavailable", "stores": stores},
                 )
             return
+        if path == "/openapi.json":
+            schemas: dict[str, Any] = {
+                name: cls.model_json_schema()
+                for name, cls in sorted(self.server.model_registry.items())
+            }
+            openapi_doc: dict[str, Any] = {
+                "openapi": "3.1.0",
+                "info": {
+                    "title": "SelfHealAPI Control Plane",
+                    "version": SERVER_VERSION,
+                },
+                "paths": {
+                    "/healthz": {"get": {"summary": "Liveness probe"}},
+                    "/readyz": {"get": {"summary": "Readiness probe across SQLite stores"}},
+                    "/metrics": {"get": {"summary": "JSON or Prometheus metrics"}},
+                    "/openapi.json": {"get": {"summary": "OpenAPI 3.1.0 specification"}},
+                    "/api/v1/events": {"get": {"summary": "Paginated zero-PII drift events"}},
+                    "/api/v1/summary": {"get": {"summary": "Tenant drift summary"}},
+                    "/dashboard": {"get": {"summary": "Self-contained HTML Drift Console"}},
+                    "/webhooks/drift": {"post": {"summary": "Ingest drift payload"}},
+                    "/webhooks/stripe": {"post": {"summary": "Stripe billing webhook"}},
+                    "/webhooks/github": {"post": {"summary": "GitHub App webhook"}},
+                },
+                "components": {"schemas": schemas},
+            }
+            self._send_json(HTTPStatus.OK, openapi_doc)
+            return
         if path == "/metrics":
             fmt_vals = query.get("format")
             if fmt_vals and fmt_vals[0].strip().lower() == "prometheus":

@@ -1138,3 +1138,21 @@ def test_readyz_checks_all_control_plane_stores_and_events_pagination() -> None:
         assert down_status == 503
         assert down_body["status"] == "unavailable"
         assert down_body["stores"]["billing"] is False
+
+
+def test_openapi_json_endpoint_exposes_paths_and_registered_models() -> None:
+    class _OpenAPIOrder(BaseModel):
+        order_id: str
+
+    with _running_server(
+        ServerConfig(), model_registry={"_OpenAPIOrder": _OpenAPIOrder}
+    ) as (_server, base_url):
+        status, headers, doc = _http_request(f"{base_url}/openapi.json")
+        assert status == 200
+        assert doc["openapi"] == "3.1.0"
+        assert "/webhooks/drift" in doc["paths"]
+        assert "/api/v1/events" in doc["paths"]
+        assert "_OpenAPIOrder" in doc["components"]["schemas"]
+        assert {k.lower(): v for k, v in headers.items()}.get(
+            "x-content-type-options"
+        ) == "nosniff"

@@ -62,6 +62,13 @@ def _render_event_row(event: dict[str, Any]) -> str:
     pr_value = event.get("pr_url") or event.get("pr_number") or event.get("pr_opened")
     if pr_value is True:
         pr_cell = '<span class="badge badge-pr">Opened</span>'
+    elif isinstance(pr_value, str) and pr_value.startswith(("https://", "http://")):
+        safe_url = _esc(pr_value)
+        pr_cell = (
+            f'<a class="pr-link mono" href="{safe_url}" '
+            'target="_blank" rel="noopener noreferrer">'
+            f"{safe_url}</a>"
+        )
     elif pr_value:
         pr_cell = f'<span class="mono">{_esc(pr_value)}</span>'
     else:
@@ -91,6 +98,11 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
     drifted_events = _esc(snapshot.drifted_events)
     unique_fingerprints = _esc(snapshot.unique_fingerprints)
     prs_opened = _esc(snapshot.prs_opened)
+    drift_rate = (
+        f"{(snapshot.drifted_events / snapshot.total_events) * 100:.1f}%"
+        if snapshot.total_events > 0
+        else "0.0%"
+    )
 
     if snapshot.recent_events:
         rows_html = "\n".join(_render_event_row(event) for event in snapshot.recent_events)
@@ -109,20 +121,50 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
   <title>SelfHealAPI Drift Console — {org_id}</title>
   <style>
     :root {{
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --surface-alt: #0b1220;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --ok-bg: rgba(34, 197, 94, 0.16);
-      --ok-fg: #4ade80;
-      --warn-bg: rgba(245, 158, 11, 0.18);
+      --bg: #09090b;
+      --surface: #111114;
+      --surface-alt: #18181b;
+      --border: rgba(255, 255, 255, 0.09);
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --accent: #6366f1;
+      --ok-bg: rgba(16, 185, 129, 0.14);
+      --ok-fg: #34d399;
+      --warn-bg: rgba(245, 158, 11, 0.16);
       --warn-fg: #fbbf24;
-      --pr-bg: rgba(56, 189, 248, 0.16);
-      --pr-fg: #38bdf8;
+      --pr-bg: rgba(99, 102, 241, 0.16);
+      --pr-fg: #818cf8;
     }}
+    @media (prefers-color-scheme: light) {{
+      :root {{
+        --bg: #fafafa;
+        --surface: #ffffff;
+        --surface-alt: #f4f4f5;
+        --border: rgba(9, 9, 11, 0.1);
+        --text: #09090b;
+        --muted: #71717a;
+        --accent: #4f46e5;
+        --ok-bg: rgba(16, 185, 129, 0.12);
+        --ok-fg: #059669;
+        --warn-bg: rgba(245, 158, 11, 0.14);
+        --warn-fg: #d97706;
+        --pr-bg: rgba(79, 70, 229, 0.12);
+        --pr-fg: #4f46e5;
+      }}
+    }}
+    .icon {{
+      width: 15px;
+      height: 15px;
+      vertical-align: -2px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.75;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+    .pr-link {{ color: var(--pr-fg); text-decoration: none; }}
+    .pr-link:hover {{ text-decoration: underline; }}
+    .card-value, .mono {{ font-variant-numeric: tabular-nums; }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
@@ -302,6 +344,7 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
     <section class="quota-bar" aria-label="Plan Quotas">
       <div class="quota-pill">Rate Limit:<strong>{rpm_limit} req/min</strong></div>
       <div class="quota-pill">LLM Synthesis Quota:<strong>{llm_limit} calls</strong></div>
+      <div class="quota-pill">Drift Rate:<strong>{drift_rate}</strong></div>
     </section>
 
     <section class="grid" aria-label="Drift Metrics">
