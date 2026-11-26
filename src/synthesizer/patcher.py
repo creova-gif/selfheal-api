@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+import copy
+from collections import defaultdict
+from types import UnionType
+from typing import Any, Union, get_args, get_origin
 
 import libcst as cst
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -17,6 +20,8 @@ class PatchAction(BaseModel):
     expected_type: str
     observed_kind: str
     source_path: tuple[str | int, ...] | None = None
+    target_parent_path: tuple[str, ...] = ()
+    nested_path: tuple[str, ...] = ()
 
 
 class PatchPlan(BaseModel):
@@ -46,14 +51,81 @@ class VerificationResult(BaseModel):
     error_detail: str | None = None
 
 
-def build_patch_plan(report: DriftReport) -> PatchPlan:
+def _resolve_target_model_at_path(
+    root_model: type[BaseModel] | None, path: tuple[str | int, ...]
+) -> str | None:
+    if root_model is None or len(path) < 2:
+        return None
+    curr_model: type[BaseModel] | None = root_model
+    for seg in path[:-1]:
+        if isinstance(seg, int):
+            continue
+        if curr_model is None or seg not in curr_model.model_fields:
+            return None
+        ann = curr_model.model_fields[seg].annotation
+        next_model: type[BaseModel] | None = None
+        if isinstance(ann, type) and issubclass(ann, BaseModel):
+            next_model = ann
+        else:
+            origin = get_origin(ann)
+            if origin in (Union, UnionType, list):
+                for arg in get_args(ann):
+                    if isinstance(arg, type) and issubclass(arg, BaseModel):
+                        next_model = arg
+                        break
+        if next_model is None:
+            return None
+        curr_model = next_model
+    return curr_model.__name__ if curr_model is not None else None
+
+
+def build_patch_plan(
+    report: DriftReport, root_model: type[BaseModel] | None = None
+) -> PatchPlan:
     actions: list[PatchAction] = []
     for issue in report.issues:
         if issue.kind == DriftKind.EXTRA_FIELD or issue.kind == DriftKind.INVALID_JSON:
             continue
         if not issue.path:
             continue
-        field_name = str(issue.path[0])
+        str_segments = tuple(str(s) for s in issue.path if not isinstance(s, int))
+        if not str_segments:
+            continue
+
+        child_model_name = _resolve_target_model_at_path(root_model, issue.path)
+        if child_model_name is not None and len(str_segments) >= 2:
+            prefix = issue.path[:-1]
+            src_path = issue.candidate_source_path
+            if src_path is None or (
+                len(src_path) > len(prefix) and src_path[: len(prefix)] == prefix
+            ):
+                rel_src = src_path[len(prefix) :] if src_path is not None else None
+                actions.append(
+                    PatchAction(
+                        target_model=child_model_name,
+                        target_field=str_segments[-1],
+                        drift_kind=issue.kind,
+                        expected_type=issue.expected_type,
+                        observed_kind=issue.observed_kind,
+                        source_path=rel_src,
+                        nested_path=str_segments[:-1],
+                    )
+                )
+            else:
+                actions.append(
+                    PatchAction(
+                        target_model=report.model_name,
+                        target_field=str_segments[-1],
+                        drift_kind=issue.kind,
+                        expected_type=issue.expected_type,
+                        observed_kind=issue.observed_kind,
+                        source_path=src_path,
+                        target_parent_path=str_segments[:-1],
+                    )
+                )
+            continue
+
+        field_name = str_segments[0]
         actions.append(
             PatchAction(
                 target_model=report.model_name,
@@ -91,6 +163,39 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
     exp = action.expected_type
     exp_lower = exp.lower()
     lines: list[str] = []
+
+    if action.target_parent_path and action.source_path is not None:
+        curr_expr = "normalized"
+        for p_attr in action.target_parent_path:
+            lines.append(f"if not isinstance({curr_expr}.get({p_attr!r}), dict):")
+            lines.append(f"    {curr_expr}[{p_attr!r}] = {{}}")
+            curr_expr = f"{curr_expr}[{p_attr!r}]"
+
+        src_parts = [str(seg) for seg in action.source_path]
+        cond_parts = [f"{f!r} not in {curr_expr}"]
+        src_expr = "normalized"
+        for part in src_parts[:-1]:
+            cond_parts.append(f"isinstance({src_expr}.get({part!r}), dict)")
+            src_expr = f"{src_expr}[{part!r}]"
+        last_part = src_parts[-1]
+        cond_parts.append(f"{last_part!r} in {src_expr}")
+        lines.append(f"if {' and '.join(cond_parts)}:")
+        lines.append(f"    {curr_expr}[{f!r}] = {src_expr}[{last_part!r}]")
+        if "int" in exp_lower and "list" not in exp_lower and "dict" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
+            lines.append(f"    try: {curr_expr}[{f!r}] = int({curr_expr}[{f!r}])")
+            lines.append("    except (TypeError, ValueError): pass")
+        elif "float" in exp_lower and "list" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
+            lines.append(f"    try: {curr_expr}[{f!r}] = float({curr_expr}[{f!r}])")
+            lines.append("    except (TypeError, ValueError): pass")
+        elif "bool" in exp_lower and "list" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
+            lines.append(
+                f"    {curr_expr}[{f!r}] = {curr_expr}[{f!r}].strip().lower() "
+                "in ('true', '1', 'yes')"
+            )
+        return lines
 
     if action.source_path is not None:
         if len(action.source_path) == 1:
@@ -153,7 +258,24 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
             comp = (
                 f"    normalized[{f!r}] = ["
                 f"int(float(item)) for item in normalized[{f!r}] "
-                f"if isinstance(item, (int, float, str))]"
+                f"if not isinstance(item, bool) and isinstance(item, (int, float, str))]"
+            )
+            lines.append(comp)
+        elif "list[float]" in exp_lower:
+            lines.append(f"if isinstance(normalized.get({f!r}), list):")
+            comp = (
+                f"    normalized[{f!r}] = ["
+                f"float(item) for item in normalized[{f!r}] "
+                f"if not isinstance(item, bool) and isinstance(item, (int, float, str))]"
+            )
+            lines.append(comp)
+        elif "list[bool]" in exp_lower:
+            lines.append(f"if isinstance(normalized.get({f!r}), list):")
+            comp = (
+                f"    normalized[{f!r}] = ["
+                f"item.strip().lower() in ('true', '1', 'yes') "
+                f"if isinstance(item, str) else bool(item) "
+                f"for item in normalized[{f!r}]]"
             )
             lines.append(comp)
     elif "int" in exp_lower and "dict" not in exp_lower:
@@ -232,10 +354,10 @@ def _build_validator_method_cst(actions: tuple[PatchAction, ...]) -> cst.Functio
     ]
     seen_fields: set[tuple[str, DriftKind, tuple[str | int, ...] | None]] = set()
     for action in actions:
-        dedup_key = (action.target_field, action.drift_kind, action.source_path)
-        if dedup_key in seen_fields:
+        dedup_id = (action.target_field, action.drift_kind, action.source_path)
+        if dedup_id in seen_fields:
             continue
-        seen_fields.add(dedup_key)
+        seen_fields.add(dedup_id)
         for line in _coercion_lines_for_action(action):
             body_lines.append(f"    {line}")
 
@@ -251,17 +373,21 @@ class _ModelPatchTransformer(cst.CSTTransformer):
     def __init__(self, plan: PatchPlan) -> None:
         super().__init__()
         self._plan = plan
-        self._widen_to_str_fields: set[str] = {
-            a.target_field
-            for a in plan.actions
-            if a.drift_kind == DriftKind.ENUM_DRIFT
-        }
-        self._widen_nullable_fields: set[str] = {
-            a.target_field
-            for a in plan.actions
-            if a.drift_kind == DriftKind.NULLABILITY_DRIFT
-            and a.expected_type.lower().startswith("literal")
-        }
+        self._actions_by_model: dict[str, list[PatchAction]] = defaultdict(list)
+        for action in plan.actions:
+            self._actions_by_model[action.target_model].append(action)
+        self._widen_to_str_by_model: dict[str, set[str]] = defaultdict(set)
+        self._widen_nullable_by_model: dict[str, set[str]] = defaultdict(set)
+        for action in plan.actions:
+            if action.drift_kind == DriftKind.ENUM_DRIFT:
+                self._widen_to_str_by_model[action.target_model].add(action.target_field)
+            elif (
+                action.drift_kind == DriftKind.NULLABILITY_DRIFT
+                and action.expected_type.lower().startswith("literal")
+            ):
+                self._widen_nullable_by_model[action.target_model].add(
+                    action.target_field
+                )
         self._has_any_import = False
         self._has_model_validator_import = False
 
@@ -283,13 +409,20 @@ class _ModelPatchTransformer(cst.CSTTransformer):
     def leave_ClassDef(
         self, original_node: cst.ClassDef, updated_node: cst.ClassDef
     ) -> cst.ClassDef:
-        if updated_node.name.value != self._plan.model_name:
+        class_name = updated_node.name.value
+        model_actions = tuple(self._actions_by_model.get(class_name, ()))
+        if not model_actions and class_name != self._plan.model_name:
             return updated_node
+
+        widen_str = self._widen_to_str_by_model.get(class_name, set())
+        widen_null = self._widen_nullable_by_model.get(class_name, set())
 
         new_stmts: list[cst.BaseStatement | cst.BaseSmallStatement] = []
         for stmt in updated_node.body.body:
             if isinstance(stmt, cst.SimpleStatementLine):
-                updated_line = self._transform_class_attribute_line(stmt)
+                updated_line = self._transform_class_attribute_line(
+                    stmt, widen_str, widen_null
+                )
                 new_stmts.append(updated_line)
             elif (
                 isinstance(stmt, cst.FunctionDef)
@@ -299,8 +432,8 @@ class _ModelPatchTransformer(cst.CSTTransformer):
             else:
                 new_stmts.append(stmt)
 
-        if self._plan.actions:
-            validator_fn = _build_validator_method_cst(self._plan.actions)
+        if model_actions:
+            validator_fn = _build_validator_method_cst(model_actions)
             new_stmts.append(validator_fn)
 
         return updated_node.with_changes(
@@ -308,7 +441,10 @@ class _ModelPatchTransformer(cst.CSTTransformer):
         )
 
     def _transform_class_attribute_line(
-        self, line: cst.SimpleStatementLine
+        self,
+        line: cst.SimpleStatementLine,
+        widen_str: set[str],
+        widen_null: set[str],
     ) -> cst.SimpleStatementLine:
         new_small_stmts: list[cst.BaseSmallStatement] = []
         for small in line.body:
@@ -316,11 +452,11 @@ class _ModelPatchTransformer(cst.CSTTransformer):
                 small.target, cst.Name
             ):
                 field_name = small.target.value
-                if field_name in self._widen_to_str_fields:
+                if field_name in widen_str:
                     small = small.with_changes(
                         annotation=cst.Annotation(annotation=cst.Name("str"))
                     )
-                elif field_name in self._widen_nullable_fields:
+                elif field_name in widen_null:
                     small = small.with_changes(
                         annotation=cst.Annotation(
                             annotation=cst.parse_expression("str | None")
@@ -374,8 +510,12 @@ class _ModelPatchTransformer(cst.CSTTransformer):
         return updated_node.with_changes(body=tuple(new_body))
 
 
-def synthesize_patch(source_code: str, report: DriftReport) -> PatchResult:
-    plan = build_patch_plan(report)
+def synthesize_patch(
+    source_code: str,
+    report: DriftReport,
+    root_model: type[BaseModel] | None = None,
+) -> PatchResult:
+    plan = build_patch_plan(report, root_model=root_model)
     if not report.has_drift:
         return PatchResult(
             model_name=report.model_name,
@@ -397,6 +537,57 @@ def synthesize_patch(source_code: str, report: DriftReport) -> PatchResult:
         plan=plan,
         applied=patched_code != source_code,
     )
+
+
+def _apply_action_to_target(
+    target: dict[str, Any], action: PatchAction, preserve_parent: bool = False
+) -> None:
+    """Apply a single PatchAction in-place on its target dict."""
+    local_action = (
+        action.model_copy(update={"target_parent_path": ()})
+        if action.target_parent_path and not preserve_parent
+        else action
+    )
+    code_lines = _coercion_lines_for_action(local_action)
+    if code_lines:
+        scope: dict[str, Any] = {"normalized": target}
+        exec("\n".join(code_lines), {}, scope)
+
+
+def _walk_and_apply(
+    node: Any, path_rest: tuple[str | int, ...], action: PatchAction
+) -> None:
+    if not path_rest:
+        if isinstance(node, dict):
+            _apply_action_to_target(node, action)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, dict):
+                    _apply_action_to_target(item, action)
+        return
+    seg = path_rest[0]
+    if isinstance(node, list):
+        next_rest = path_rest[1:] if isinstance(seg, int) else path_rest
+        for item in node:
+            _walk_and_apply(item, next_rest, action)
+    elif isinstance(seg, str) and isinstance(node, dict) and seg in node:
+        _walk_and_apply(node[seg], path_rest[1:], action)
+
+
+def apply_patch_plan_in_memory(
+    payload: dict[str, Any],
+    plan: PatchPlan,
+    allowed_fields: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = copy.deepcopy(payload)
+    for action in plan.actions:
+        if action.target_model == plan.model_name:
+            _apply_action_to_target(normalized, action, preserve_parent=True)
+        elif action.nested_path:
+            _walk_and_apply(normalized, action.nested_path, action)
+    if allowed_fields is not None:
+        return {k: v for k, v in normalized.items() if k in allowed_fields}
+    return normalized
 
 
 def verify_patch(
@@ -438,7 +629,9 @@ def verify_patch(
         )
 
     try:
-        model_cls.model_rebuild(_types_namespace=namespace)
+        for obj in namespace.values():
+            if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel:
+                obj.model_rebuild(_types_namespace=namespace, force=True)
         model_cls.model_validate(drifted_payload, strict=True)
         drifted_ok = True
     except ValidationError as exc:
