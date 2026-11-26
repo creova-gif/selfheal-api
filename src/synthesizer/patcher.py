@@ -165,16 +165,35 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
     lines: list[str] = []
 
     if action.target_parent_path and action.source_path is not None:
-        parent_attr = action.target_parent_path[0]
-        lines.append(f"if not isinstance(normalized.get({parent_attr!r}), dict):")
-        lines.append(f"    normalized[{parent_attr!r}] = {{}}")
-        if len(action.source_path) == 1:
-            src_attr = str(action.source_path[0])
+        curr_expr = "normalized"
+        for p_attr in action.target_parent_path:
+            lines.append(f"if not isinstance({curr_expr}.get({p_attr!r}), dict):")
+            lines.append(f"    {curr_expr}[{p_attr!r}] = {{}}")
+            curr_expr = f"{curr_expr}[{p_attr!r}]"
+
+        src_parts = [str(seg) for seg in action.source_path]
+        cond_parts = [f"{f!r} not in {curr_expr}"]
+        src_expr = "normalized"
+        for part in src_parts[:-1]:
+            cond_parts.append(f"isinstance({src_expr}.get({part!r}), dict)")
+            src_expr = f"{src_expr}[{part!r}]"
+        last_part = src_parts[-1]
+        cond_parts.append(f"{last_part!r} in {src_expr}")
+        lines.append(f"if {' and '.join(cond_parts)}:")
+        lines.append(f"    {curr_expr}[{f!r}] = {src_expr}[{last_part!r}]")
+        if "int" in exp_lower and "list" not in exp_lower and "dict" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
+            lines.append(f"    try: {curr_expr}[{f!r}] = int({curr_expr}[{f!r}])")
+            lines.append("    except (TypeError, ValueError): pass")
+        elif "float" in exp_lower and "list" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
+            lines.append(f"    try: {curr_expr}[{f!r}] = float({curr_expr}[{f!r}])")
+            lines.append("    except (TypeError, ValueError): pass")
+        elif "bool" in exp_lower and "list" not in exp_lower:
+            lines.append(f"if isinstance({curr_expr}.get({f!r}), str):")
             lines.append(
-                f"if {f!r} not in normalized[{parent_attr!r}] and {src_attr!r} in normalized:"
-            )
-            lines.append(
-                f"    normalized[{parent_attr!r}][{f!r}] = normalized[{src_attr!r}]"
+                f"    {curr_expr}[{f!r}] = {curr_expr}[{f!r}].strip().lower() "
+                "in ('true', '1', 'yes')"
             )
         return lines
 
@@ -547,9 +566,10 @@ def _walk_and_apply(
                     _apply_action_to_target(item, action)
         return
     seg = path_rest[0]
-    if isinstance(seg, int) and isinstance(node, list):
+    if isinstance(node, list):
+        next_rest = path_rest[1:] if isinstance(seg, int) else path_rest
         for item in node:
-            _walk_and_apply(item, path_rest[1:], action)
+            _walk_and_apply(item, next_rest, action)
     elif isinstance(seg, str) and isinstance(node, dict) and seg in node:
         _walk_and_apply(node[seg], path_rest[1:], action)
 

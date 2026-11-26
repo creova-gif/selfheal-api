@@ -30,6 +30,33 @@ def _emit_ts_action_lines(action: PatchAction, action_idx: int = 0) -> list[str]
     v0 = f"_src_{f}_{action_idx}_0"
     v1 = f"_src_{f}_{action_idx}_1"
 
+    if action.target_parent_path and action.source_path is not None:
+        parent_var = f"_parent_{f}_{action_idx}"
+        p_attr = str(action.target_parent_path[0])
+        lines.append(
+            f"  if (typeof normalized[{p_attr!r}] !== 'object' "
+            f"|| normalized[{p_attr!r}] === null || Array.isArray(normalized[{p_attr!r}])) {{"
+        )
+        lines.append(f"    normalized[{p_attr!r}] = {{}};")
+        lines.append("  }")
+        lines.append(
+            f"  const {parent_var} = normalized[{p_attr!r}] as Record<string, unknown>;"
+        )
+        for sub_p in action.target_parent_path[1:]:
+            lines.append(
+                f"  if (typeof {parent_var}[{sub_p!r}] !== 'object' "
+                f"|| {parent_var}[{sub_p!r}] === null) {{ {parent_var}[{sub_p!r}] = {{}}; }}"
+            )
+        target_obj = parent_var
+        for sub_p in action.target_parent_path[1:]:
+            target_obj = f"({target_obj}[{sub_p!r}] as Record<string, unknown>)"
+        if len(action.source_path) == 1:
+            src = str(action.source_path[0])
+            lines.append(f"  if (!({f!r} in {target_obj}) && ({src!r} in normalized)) {{")
+            lines.append(f"    {target_obj}[{f!r}] = normalized[{src!r}];")
+            lines.append("  }")
+        return lines
+
     if action.source_path is not None:
         if len(action.source_path) == 1:
             src = str(action.source_path[0])
@@ -212,7 +239,7 @@ def synthesize_zod_preprocessor(plan: PatchPlan) -> str:
                     continue
                 for act in other_actions:
                     parent_path = act.nested_path or act.target_parent_path
-                    if parent_path:
+                    if len(parent_path) == 1:
                         top_field = str(parent_path[0])
                         child_links.setdefault(top_field, f"normalize{other_model}Drift")
             for top_field, child_fn in child_links.items():

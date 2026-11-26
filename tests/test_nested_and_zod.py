@@ -163,3 +163,35 @@ def test_list_of_nested_models_preserves_child_drift_path() -> None:
     report = detect_drift(_Cart, drifted)
     assert report.has_drift
     assert any(i.path == ("items", 0, "price") for i in report.issues)
+
+
+def test_list_of_nested_models_drift_at_nonzero_index() -> None:
+    class _LineItem(BaseModel):
+        price: int
+
+    class _Cart(BaseModel):
+        items: list[_LineItem]
+
+    drifted = {"items": [{"price": 10}, {"price": "12"}]}
+    report = detect_drift(_Cart, drifted)
+    assert report.has_drift
+    assert any(
+        i.path == ("items", 0, "price") and i.observed_kind == "<int_str>"
+        for i in report.issues
+    )
+
+
+def test_zod_preprocessor_handles_root_to_child_relocation() -> None:
+    mutated = {
+        "order_id": "ord_123",
+        "billing": {"city": "San Francisco"},
+        "billing_postal_code": "94107",
+        "quantities": [1],
+        "weights": [1.5],
+        "flags": [True],
+    }
+    report = detect_drift(OrderEvent, mutated)
+    patch_res = synthesize_patch(ORDER_SOURCE, report, root_model=OrderEvent)
+    zod_ts = synthesize_zod_preprocessor(patch_res.plan)
+    assert "normalized['billing']" in zod_ts
+    assert "_parent_postal_code_0['postal_code'] = normalized['billing_postal_code']" in zod_ts

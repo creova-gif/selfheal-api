@@ -490,7 +490,7 @@ def detect_drift(
             field_loc: tuple[str | int, ...] = tuple(
                 0 if isinstance(seg, int) else seg for seg in loc_tuple
             )
-            found, observed_val = _lookup_path(parsed, field_loc)
+            found, observed_val = _lookup_path(parsed, loc_tuple)
             kind = _classify_validation_error(err, observed_val if found else None)
             expected_type = _resolve_expected_type(expected_model, field_loc)
             if not found:
