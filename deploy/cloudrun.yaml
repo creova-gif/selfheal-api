@@ -26,6 +26,8 @@ spec:
               cpu: "1"
               memory: 512Mi
           env:
+            - name: SELFHEAL_RETENTION_DAYS
+              value: "30"
             - name: SELFHEAL_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

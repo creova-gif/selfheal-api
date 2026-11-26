@@ -824,3 +824,12 @@ def test_cli_schema_formats_and_out(
     rc_bad = main(["schema", "--model", "missing_colon"])
     assert rc_bad == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_cli_doctor_reports_sqlite_info(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["doctor", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sqlite"]["writable"] is True
+    assert isinstance(payload["sqlite"]["version"], str)
+    assert payload["sqlite"]["db_path"] == ":memory:"

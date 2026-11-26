@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -410,13 +411,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     binary_names = ("ruff", "mypy", "pytest", "git", "gh")
     binary_paths = {name: shutil.which(name) for name in binary_names}
     anthropic_configured = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    db_path_env = os.environ.get("SELFHEAL_DB_PATH", "").strip() or ":memory:"
+    db_writable = (
+        True
+        if db_path_env == ":memory:" or db_path_env.startswith("file:")
+        else os.access(Path(db_path_env).parent, os.W_OK)
+        if Path(db_path_env).parent.exists()
+        else True
+    )
 
-    healthy = python_ok and pydantic_ok and libcst_ok
+    healthy = python_ok and pydantic_ok and libcst_ok and db_writable
 
     if args.json:
         report: dict[str, Any] = {
             "healthy": healthy,
             "python_version": {"version": py_ver, "ok": python_ok},
+            "sqlite": {
+                "version": sqlite3.sqlite_version,
+                "db_path": db_path_env,
+                "writable": db_writable,
+            },
             "packages": {
                 "pydantic": pydantic_info,
                 "libcst": libcst_info,
@@ -431,6 +445,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     else:
         lines = [
             f"[{'ok' if python_ok else 'FAIL'}] python >= 3.12 ({py_ver})",
+            f"[{'ok' if db_writable else 'FAIL'}] sqlite "
+            f"({sqlite3.sqlite_version}, db_path={db_path_env})",
             f"[{'ok' if pydantic_ok else 'FAIL'}] pydantic "
             f"({pydantic_info['version'] or 'not installed'})",
             f"[{'ok' if libcst_ok else 'FAIL'}] libcst "
