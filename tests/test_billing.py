@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -368,3 +369,45 @@ def test_stripe_retry_applies_update_after_org_id_is_linked() -> None:
     assert resp3["plan"] == "team"
     assert store.get_subscription("org-retry").plan == PlanTier.TEAM
     assert store.is_event_processed("evt_early_upd") is True
+
+
+def test_billing_store_sqlite_restart_persistence(tmp_path: Path) -> None:
+    db_path = tmp_path / "control_plane.db"
+    store1 = BillingStore(db_path=db_path, max_processed_events=3)
+    assert store1.ping() is True
+
+    store1.upsert_subscription(
+        SubscriptionState(
+            org_id="org-persist",
+            plan=PlanTier.PRO,
+            status="active",
+            stripe_customer_id="cus_p",
+            stripe_subscription_id="sub_p",
+        )
+    )
+    assert store1.mark_event_processed("evt_p1") is True
+    store1.record_event_created(org_id="org-persist", subscription_id="sub_p", created=2000)
+    store1.close()
+    assert store1.ping() is False
+
+    store2 = BillingStore(db_path=db_path, max_processed_events=3)
+    assert store2.ping() is True
+    sub = store2.get_subscription("org-persist")
+    assert sub.plan == PlanTier.PRO
+    assert sub.status == "active"
+    assert sub.stripe_customer_id == "cus_p"
+    assert sub.stripe_subscription_id == "sub_p"
+    assert store2.list_org_ids() == ["org-persist"]
+    assert store2.find_org_by_stripe_ids(customer_id="cus_p") == "org-persist"
+    assert store2.find_org_by_stripe_ids(subscription_id="sub_p") == "org-persist"
+    assert store2.is_event_processed("evt_p1") is True
+    assert store2.mark_event_processed("evt_p1") is False
+    assert (
+        store2.is_stale_event(org_id="org-persist", subscription_id="sub_p", created=1999)
+        is True
+    )
+    assert (
+        store2.is_stale_event(org_id="org-persist", subscription_id="sub_p", created=2000)
+        is False
+    )
+    store2.close()

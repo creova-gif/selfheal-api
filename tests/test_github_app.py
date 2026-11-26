@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -308,3 +309,35 @@ def test_urllib_github_app_client_https_enforcement_and_slug_validation() -> Non
                 head="h",
                 base="main",
             )
+
+
+def test_installation_registry_sqlite_restart_persistence(tmp_path: Path) -> None:
+    db_path = tmp_path / "control_plane.db"
+    reg1 = InstallationRegistry(db_path=db_path)
+    assert reg1.ping() is True
+
+    reg1.upsert(
+        InstallationRecord(
+            installation_id=9001,
+            org_id="org-gh",
+            account_login="org-gh",
+            repositories=("org-gh/repo1",),
+            suspended=False,
+        )
+    )
+    reg1.add_repositories(9001, ("org-gh/repo2",))
+    reg1.set_suspended(9001, True)
+    reg1.close()
+    assert reg1.ping() is False
+
+    reg2 = InstallationRegistry(db_path=db_path)
+    assert reg2.ping() is True
+    assert reg2.list_org_ids() == ["org-gh"]
+    rec = reg2.get_by_org("org-gh")
+    assert rec is not None
+    assert rec.installation_id == 9001
+    assert rec.account_login == "org-gh"
+    assert rec.repositories == ("org-gh/repo1", "org-gh/repo2")
+    assert rec.suspended is True
+    assert reg2.get_by_installation(9001) == rec
+    reg2.close()

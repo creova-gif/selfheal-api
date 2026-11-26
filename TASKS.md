@@ -40,3 +40,11 @@
 - [x] Enterprise observability: `/readyz` readiness probe, `X-Request-Id` correlation, and Prometheus metrics
 - [x] `selfheal doctor` CLI subcommand (`--json` and human-readable checklist, zero-secret `ANTHROPIC_API_KEY` check)
 - [x] Document ADR-007 (`docs/adr/007-runtime-exec-removal-and-enterprise-observability.md`) and update `TASKS.md`
+
+## Wave 8: Milestone 8 — Durable Control-Plane Persistence, Hardening & CI Matrix
+- [x] SQLite WAL persistence for `BillingStore` and `InstallationRegistry` sharing `SELFHEAL_DB_PATH`
+- [x] Graceful `SIGTERM` shutdown handling and container `HEALTHCHECK`
+- [x] HTTP security response headers on server endpoints
+- [x] Deterministic performance benchmark suite for hot-path drift detection and normalization
+- [x] Python 3.12 / 3.13 CI matrix with `selfheal doctor --json` gate in `.github/workflows/ci.yml`
+- [x] Document ADR-008 (`docs/adr/008-durable-control-plane-persistence.md`), `TASKS.md`, and `CHANGELOG.md`

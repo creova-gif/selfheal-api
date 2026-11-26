@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -994,3 +995,88 @@ def test_security_headers_on_json_and_html_responses() -> None:
         assert lower_dh.get("x-content-type-options") == "nosniff"
         assert lower_dh.get("x-frame-options") == "DENY"
         assert "default-src 'none'" in (lower_dh.get("content-security-policy") or "")
+
+
+def test_control_plane_sqlite_restart_persistence(tmp_path: Path) -> None:
+    db_path = tmp_path / "control_plane.db"
+    cfg = ServerConfig(
+        db_path=str(db_path),
+        stripe_webhook_secret="whsec_srv",
+        github_webhook_secret="ghsec_srv",
+    )
+
+    ts = int(time.time())
+    stripe_body = json.dumps(
+        {
+            "id": "evt_srv_persist",
+            "type": "checkout.session.completed",
+            "created": ts,
+            "data": {
+                "object": {
+                    "customer": "cus_srv",
+                    "subscription": "sub_srv",
+                    "metadata": {"org_id": "org-srv-persist", "plan": "team"},
+                }
+            },
+        }
+    ).encode("utf-8")
+    stripe_sig = hmac.new(
+        b"whsec_srv",
+        f"{ts}.".encode() + stripe_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    gh_body = json.dumps(
+        {
+            "action": "created",
+            "installation": {
+                "id": 777,
+                "account": {"login": "org-srv-persist"},
+                "suspended_at": None,
+            },
+            "repositories": [{"full_name": "org-srv-persist/api"}],
+        }
+    ).encode("utf-8")
+    gh_sig = (
+        "sha256="
+        + hmac.new(b"ghsec_srv", gh_body, hashlib.sha256).hexdigest()
+    )
+
+    with _running_server(cfg) as (server1, base_url1):
+        s_status, _, _ = _http_request(
+            f"{base_url1}/webhooks/stripe",
+            method="POST",
+            body=stripe_body,
+            headers={"Stripe-Signature": f"t={ts},v1={stripe_sig}"},
+        )
+        assert s_status == 200
+
+        g_status, _, _ = _http_request(
+            f"{base_url1}/webhooks/github",
+            method="POST",
+            body=gh_body,
+            headers={
+                "X-Hub-Signature-256": gh_sig,
+                "X-GitHub-Event": "installation",
+            },
+        )
+        assert g_status == 200
+
+        server1.drift_ledger.close()
+        server1.billing_store.close()
+        server1.installation_registry.close()
+
+    with _running_server(cfg) as (server2, _base_url2):
+        sub = server2.billing_store.get_subscription("org-srv-persist")
+        assert sub.plan == PlanTier.TEAM
+        assert sub.stripe_customer_id == "cus_srv"
+        assert sub.stripe_subscription_id == "sub_srv"
+
+        gh_rec = server2.installation_registry.get_by_org("org-srv-persist")
+        assert gh_rec is not None
+        assert gh_rec.installation_id == 777
+        assert gh_rec.repositories == ("org-srv-persist/api",)
+
+        server2.drift_ledger.close()
+        server2.billing_store.close()
+        server2.installation_registry.close()

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Milestone 8 (Durable Control Plane, Hardening & CI Matrix)**:
+  - Added SQLite WAL persistence for `BillingStore` and `InstallationRegistry` sharing `SELFHEAL_DB_PATH` for durable control-plane state across restarts.
+  - Added graceful `SIGTERM` shutdown handling, container `HEALTHCHECK`, and HTTP security response headers.
+  - Added deterministic performance benchmark gates in the test suite.
+  - Expanded `.github/workflows/ci.yml` to a Python 3.12 / 3.13 matrix (`fail-fast: false`) running `ruff check src tests`, `mypy --strict src tests`, `pytest -v`, and `selfheal doctor --json`.
+  - Documented `docs/adr/008-durable-control-plane-persistence.md`.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

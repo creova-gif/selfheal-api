@@ -804,6 +804,8 @@ def create_server(
         resolved_models = {}
     registry = TenantRegistry(resolved_config)
     ledger = DriftLedger(db_path=resolved_config.db_path)
+    billing_store = BillingStore(db_path=resolved_config.db_path)
+    installation_registry = InstallationRegistry(db_path=resolved_config.db_path)
     return SelfHealHTTPServer(
         (host, port),
         SelfHealRequestHandler,
@@ -811,6 +813,8 @@ def create_server(
         registry=registry,
         model_registry=resolved_models,
         drift_ledger=ledger,
+        billing_store=billing_store,
+        installation_registry=installation_registry,
     )
 
 
@@ -933,6 +937,10 @@ def main_server(argv: list[str] | None = None) -> int:
             signal.signal(signal.SIGTERM, prev_sigterm)
         if hasattr(server, "drift_ledger"):
             server.drift_ledger.close()
+        if hasattr(server, "billing_store"):
+            server.billing_store.close()
+        if hasattr(server, "installation_registry"):
+            server.installation_registry.close()
         server.server_close()
     return 0
 
