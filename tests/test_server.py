@@ -1156,3 +1156,24 @@ def test_openapi_json_endpoint_exposes_paths_and_registered_models() -> None:
         assert {k.lower(): v for k, v in headers.items()}.get(
             "x-content-type-options"
         ) == "nosniff"
+
+
+def test_head_healthz_and_readyz_probes() -> None:
+    with _running_server(ServerConfig()) as (server, base_url):
+        req_health = urllib.request.Request(f"{base_url}/healthz", method="HEAD")
+        with urllib.request.urlopen(req_health, timeout=5.0) as resp:
+            assert resp.status == 200
+            assert resp.read() == b""
+
+        req_ready = urllib.request.Request(f"{base_url}/readyz", method="HEAD")
+        with urllib.request.urlopen(req_ready, timeout=5.0) as resp:
+            assert resp.status == 200
+            assert resp.read() == b""
+
+        server.drift_ledger.close()
+        req_down = urllib.request.Request(f"{base_url}/readyz", method="HEAD")
+        try:
+            urllib.request.urlopen(req_down, timeout=5.0)
+            raise AssertionError("Expected 503 HTTPError")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 503

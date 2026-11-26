@@ -241,10 +241,23 @@ def _open_github_pr(
     )
 
 
+def _package_version() -> str:
+    try:
+        return importlib.metadata.version("selfheal-api")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.2.0"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="selfheal",
         description="SelfHealAPI schema-drift detection, CST synthesis, and verification CLI",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_package_version()}",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -427,6 +427,32 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         hdr = self.headers.get("X-SelfHeal-Org", "").strip()
         return hdr or "default"
 
+    def do_HEAD(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("X-Request-Id", self._get_request_id())
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        if path == "/readyz":
+            healthy = (
+                self.server.drift_ledger.ping()
+                and self.server.billing_store.ping()
+                and self.server.installation_registry.ping()
+            )
+            status = HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE
+            self.send_response(status.value)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("X-Request-Id", self._get_request_id())
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.NOT_FOUND.value)
+        self.send_header("X-Request-Id", self._get_request_id())
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path

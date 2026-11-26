@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from selfheal_api.cli import main
 from synthesizer.patcher import PatchPlan, PatchResult, VerificationResult
 
@@ -720,3 +722,11 @@ def test_cli_heal_open_pr_failure_restores_existing_exports_and_modes(
     assert stat.S_IMODE(zod_out.stat().st_mode) == 0o640
     assert openapi_out.read_bytes() == orig_openapi_bytes
     assert stat.S_IMODE(openapi_out.stat().st_mode) == 0o750
+
+
+def test_cli_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "selfheal 0.2.0" in captured.out
