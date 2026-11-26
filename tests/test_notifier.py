@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import urllib.error
@@ -11,8 +13,10 @@ from pydantic import ValidationError
 
 from selfheal_api.notifier import (
     AlertNotifier,
+    CompositeAlertNotifier,
     DriftAlert,
     MockAlertNotifier,
+    SignedWebhookNotifier,
     UrllibSlackNotifier,
     format_slack_drift_alert,
 )
@@ -130,3 +134,116 @@ def test_urllib_slack_notifier_fails_closed_on_network_errors(
 
     monkeypatch.setattr(urllib.request, "urlopen", raise_os_error)
     assert notifier.notify(_sample_alert()) is False
+
+
+def test_signed_webhook_notifier_validates_url_and_timeout() -> None:
+    for invalid_url in ["", "http://example.com/hook", "ftp://example.com/hook", "https://"]:
+        with pytest.raises(ValueError, match="https://"):
+            SignedWebhookNotifier(invalid_url)
+
+    with pytest.raises(ValueError, match="timeout_s"):
+        SignedWebhookNotifier("https://example.com/hook", timeout_s=0)
+
+
+def test_signed_webhook_notifier_signs_request_with_hmac(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> _FakeHTTPResponse:
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        captured["body"] = req.data
+        captured["timeout"] = timeout
+        return _FakeHTTPResponse(status=202)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    secret = "whsec_super_secret_key"
+    alert = _sample_alert()
+    notifier = SignedWebhookNotifier(
+        "https://hooks.example.com/selfheal",
+        signing_secret=secret,
+        timeout_s=3.5,
+    )
+    assert notifier.notify(alert) is True
+    assert captured["url"] == "https://hooks.example.com/selfheal"
+    assert captured["method"] == "POST"
+    assert captured["timeout"] == 3.5
+    assert captured["headers"]["content-type"] == "application/json"
+
+    body: bytes = captured["body"]
+    expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    assert captured["headers"]["x-selfheal-signature"] == f"sha256={expected_digest}"
+    assert json.loads(body.decode("utf-8")) == alert.model_dump(mode="json")
+
+    captured.clear()
+    unsigned = SignedWebhookNotifier("https://hooks.example.com/selfheal")
+    assert unsigned.notify(alert) is True
+    assert "x-selfheal-signature" not in captured["headers"]
+
+
+def test_signed_webhook_notifier_fails_closed_without_leaking_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "whsec_do_not_log_me"
+
+    def raise_url_error(req: urllib.request.Request, timeout: float = 0.0) -> _FakeHTTPResponse:
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_url_error)
+
+    notifier = SignedWebhookNotifier(
+        "https://hooks.example.com/SECRET_PATH",
+        signing_secret=secret,
+    )
+    with caplog.at_level(logging.WARNING):
+        result = notifier.notify(_sample_alert())
+
+    assert result is False
+    assert "URLError" in caplog.text
+    assert secret not in caplog.text
+    assert "SECRET_PATH" not in caplog.text
+
+    def return_non_2xx(req: urllib.request.Request, timeout: float = 0.0) -> _FakeHTTPResponse:
+        return _FakeHTTPResponse(status=503)
+
+    monkeypatch.setattr(urllib.request, "urlopen", return_non_2xx)
+    assert notifier.notify(_sample_alert()) is False
+
+
+class _ExplodingNotifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def notify(self, alert: DriftAlert) -> bool:
+        self.calls += 1
+        raise RuntimeError("boom_secret_detail")
+
+
+def test_composite_alert_notifier_fanout_and_isolation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    alert = _sample_alert()
+    failing = MockAlertNotifier(should_succeed=False)
+    exploding = _ExplodingNotifier()
+    succeeding = MockAlertNotifier(should_succeed=True)
+
+    composite = CompositeAlertNotifier([failing, exploding, succeeding])
+    with caplog.at_level(logging.WARNING):
+        result = composite.notify(alert)
+
+    assert result is True
+    assert failing.alerts == [alert]
+    assert exploding.calls == 1
+    assert succeeding.alerts == [alert]
+    assert "RuntimeError" in caplog.text
+    assert "boom_secret_detail" not in caplog.text
+
+    all_failing = CompositeAlertNotifier(
+        [MockAlertNotifier(should_succeed=False), _ExplodingNotifier()]
+    )
+    assert all_failing.notify(alert) is False
+    assert CompositeAlertNotifier([]).notify(alert) is False

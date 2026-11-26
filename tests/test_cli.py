@@ -730,3 +730,97 @@ def test_cli_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
     assert "selfheal 0.2.0" in captured.out
+
+
+def test_cli_init_creates_skips_and_overwrites(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["init", "--dir", str(tmp_path)])
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {
+        "created": ["selfheal.config.json", ".github/workflows/selfheal.yml"],
+        "skipped": [],
+    }
+
+    config_path = tmp_path / "selfheal.config.json"
+    workflow_path = tmp_path / ".github" / "workflows" / "selfheal.yml"
+    config_data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert {"host", "port", "db_path", "model_specs"} <= set(config_data.keys())
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    assert "selfheal doctor --json" in workflow_text
+    assert "pytest" in workflow_text
+
+    config_path.write_text('{"custom": true}\n', encoding="utf-8")
+
+    rc_skip = main(["init", "--dir", str(tmp_path)])
+    assert rc_skip == 0
+    skip_summary = json.loads(capsys.readouterr().out)
+    assert skip_summary == {
+        "created": [],
+        "skipped": ["selfheal.config.json", ".github/workflows/selfheal.yml"],
+    }
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {"custom": True}
+
+    rc_force = main(["init", "--dir", str(tmp_path), "--force"])
+    assert rc_force == 0
+    force_summary = json.loads(capsys.readouterr().out)
+    assert force_summary == {
+        "created": ["selfheal.config.json", ".github/workflows/selfheal.yml"],
+        "skipped": [],
+    }
+    restored_config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "host" in restored_config
+    assert "custom" not in restored_config
+
+
+def test_cli_schema_formats_and_out(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+
+    rc_json = main(["schema", "--model", f"{model_file}:PaymentEvent"])
+    assert rc_json == 0
+    json_schema = json.loads(capsys.readouterr().out)
+    assert json_schema["title"] == "PaymentEvent"
+    assert "id" in json_schema["properties"]
+    assert "amount" in json_schema["properties"]
+
+    rc_openapi = main(
+        ["schema", "--model", f"{model_file}:PaymentEvent", "--format", "openapi"]
+    )
+    assert rc_openapi == 0
+    openapi_doc = json.loads(capsys.readouterr().out)
+    assert openapi_doc["openapi"] == "3.1.0"
+    assert "PaymentEvent" in openapi_doc["components"]["schemas"]
+
+    rc_zod = main(
+        ["schema", "--model", f"{model_file}:PaymentEvent", "--format", "zod"]
+    )
+    assert rc_zod == 0
+    zod_out = capsys.readouterr().out
+    assert "normalizePaymentEventDrift" in zod_out
+    assert "createSelfHealZodAdapter" in zod_out
+
+    out_file = tmp_path / "nested" / "schema.openapi.json"
+    rc_out = main(
+        [
+            "schema",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--format",
+            "openapi",
+            "--out",
+            str(out_file),
+        ]
+    )
+    assert rc_out == 0
+    assert capsys.readouterr().out == ""
+    written_doc = json.loads(out_file.read_text(encoding="utf-8"))
+    assert written_doc["openapi"] == "3.1.0"
+    assert "PaymentEvent" in written_doc["components"]["schemas"]
+
+    rc_bad = main(["schema", "--model", "missing_colon"])
+    assert rc_bad == 2
+    assert "error:" in capsys.readouterr().err

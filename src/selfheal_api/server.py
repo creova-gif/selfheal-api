@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hmac
 import importlib
+import io
 import json
 import logging
 import os
@@ -43,6 +45,13 @@ _logger = logging.getLogger("selfheal_api.server")
 SERVER_VERSION = "0.2.0"
 _ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _sanitize_csv_cell(value: str) -> str:
+    """Neutralize CSV formula injection for spreadsheet consumers."""
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{value}"
+    return value
 
 
 def _parse_model_specs(raw: Any) -> list[str]:
@@ -383,12 +392,16 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         status: HTTPStatus,
         text_body: str,
         content_type: str = "text/plain; charset=utf-8",
+        extra_headers: Mapping[str, str] | None = None,
     ) -> None:
         body = text_body.encode("utf-8")
         self.send_response(status.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Request-Id", self._get_request_id())
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -494,6 +507,9 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     "/metrics": {"get": {"summary": "JSON or Prometheus metrics"}},
                     "/openapi.json": {"get": {"summary": "OpenAPI 3.1.0 specification"}},
                     "/api/v1/events": {"get": {"summary": "Paginated zero-PII drift events"}},
+                    "/api/v1/events/export": {
+                        "get": {"summary": "Export zero-PII drift events (CSV/JSONL)"}
+                    },
                     "/api/v1/summary": {"get": {"summary": "Tenant drift summary"}},
                     "/dashboard": {"get": {"summary": "Self-contained HTML Drift Console"}},
                     "/webhooks/drift": {"post": {"summary": "Ingest drift payload"}},
@@ -569,6 +585,102 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     "offset": offset,
                     "events": [ev.model_dump(mode="json") for ev in events],
                 },
+            )
+            return
+        if path == "/api/v1/events/export":
+            org_id = self._query_org_id(query)
+            if not self._authorize_tenant_read(org_id):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
+                )
+                return
+            fmt = (query.get("format") or ["csv"])[0].strip().lower()
+            if fmt not in {"csv", "jsonl"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "format must be 'csv' or 'jsonl'"},
+                )
+                return
+            try:
+                limit_raw = (query.get("limit") or ["200"])[0].strip()
+                offset_raw = (query.get("offset") or ["0"])[0].strip()
+                limit = int(limit_raw)
+                offset = int(offset_raw)
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit and offset must be integers"},
+                )
+                return
+            if limit < 1 or limit > 1000 or offset < 0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit must be in 1..1000 and offset >= 0"},
+                )
+                return
+            model_vals = query.get("model")
+            model_filter = (
+                model_vals[0].strip() if model_vals and model_vals[0].strip() else None
+            )
+            events = self.server.drift_ledger.list_events(
+                org_id=org_id,
+                model_name=model_filter,
+                limit=limit,
+                offset=offset,
+            )
+            safe_org = re.sub(r"[^A-Za-z0-9_.-]+", "_", org_id) or "default"
+            extra_headers = {
+                "Content-Disposition": (
+                    f'attachment; filename="drift-events-{safe_org}.{fmt}"'
+                ),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            }
+            if fmt == "jsonl":
+                lines = [json.dumps(ev.model_dump(mode="json")) for ev in events]
+                body_text = "\n".join(lines) + ("\n" if lines else "")
+                self._send_text(
+                    HTTPStatus.OK,
+                    body_text,
+                    content_type="application/x-ndjson; charset=utf-8",
+                    extra_headers=extra_headers,
+                )
+                return
+
+            csv_buf = io.StringIO(newline="")
+            writer = csv.writer(csv_buf, lineterminator="\r\n")
+            writer.writerow(
+                [
+                    "event_id",
+                    "created_at",
+                    "org_id",
+                    "model_name",
+                    "fingerprint",
+                    "has_drift",
+                    "issue_count",
+                    "issue_kinds",
+                    "pr_url",
+                ]
+            )
+            for ev in events:
+                writer.writerow(
+                    [
+                        "" if ev.event_id is None else ev.event_id,
+                        ev.created_at,
+                        _sanitize_csv_cell(ev.org_id),
+                        _sanitize_csv_cell(ev.model_name),
+                        _sanitize_csv_cell(ev.fingerprint),
+                        ev.has_drift,
+                        ev.issue_count,
+                        _sanitize_csv_cell(",".join(ev.issue_kinds)),
+                        _sanitize_csv_cell(ev.pr_url or ""),
+                    ]
+                )
+            self._send_text(
+                HTTPStatus.OK,
+                csv_buf.getvalue(),
+                content_type="text/csv; charset=utf-8",
+                extra_headers=extra_headers,
             )
             return
         if path == "/api/v1/summary":

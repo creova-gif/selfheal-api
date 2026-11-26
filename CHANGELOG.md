@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Milestone 9 (CLI Scaffolding & Schema Export)**:
+  - Added `selfheal init` (`--dir`, `--force`) to scaffold `selfheal.config.json` and `.github/workflows/selfheal.yml` without clobbering existing files unless `--force` is passed.
+  - Added `selfheal schema` (`--model`, `--format jsonschema|openapi|zod`, `--out`) to export Pydantic model schemas to stdout or an atomic output file.
 - **Milestone 8 (Durable Control Plane, Hardening & CI Matrix)**:
   - Added SQLite WAL persistence for `BillingStore` and `InstallationRegistry` sharing `SELFHEAL_DB_PATH` for durable control-plane state across restarts.
   - Added graceful `SIGTERM` shutdown handling, container `HEALTHCHECK`, and HTTP security response headers.

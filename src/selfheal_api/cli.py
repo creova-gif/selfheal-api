@@ -342,6 +342,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit diagnostic report as JSON",
     )
+
+    init_p = sub.add_parser(
+        "init",
+        help="Scaffold starter selfheal.config.json and GitHub Actions drift check workflow",
+    )
+    init_p.add_argument(
+        "--dir",
+        default=".",
+        help="Target directory to scaffold starter files (default: .)",
+    )
+    init_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing files if present",
+    )
+
+    schema_p = sub.add_parser(
+        "schema",
+        help="Emit JSON Schema, OpenAPI 3.1, or TypeScript/Zod schema for a Pydantic model",
+    )
+    schema_p.add_argument(
+        "--model",
+        required=True,
+        help="Model spec <path/to/file.py:ClassName>",
+    )
+    schema_p.add_argument(
+        "--format",
+        choices=("jsonschema", "openapi", "zod"),
+        default="jsonschema",
+        help="Output schema format (default: jsonschema)",
+    )
+    schema_p.add_argument(
+        "--out",
+        default=None,
+        help="Optional output file path; prints to stdout if omitted",
+    )
     return parser
 
 
@@ -431,6 +467,86 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return 0 if report.failed == 0 else 1
 
 
+_STARTER_WORKFLOW_YML = """\
+name: SelfHeal Drift Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run selfheal doctor
+        run: selfheal doctor --json
+      - name: Run pytest
+        run: pytest -v
+"""
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold starter selfheal configuration and GitHub Actions workflow."""
+    base_dir = Path(args.dir)
+    starter_config: dict[str, Any] = {
+        "host": "0.0.0.0",
+        "port": 8080,
+        "db_path": "selfheal.db",
+        "model_specs": ["path/to/models.py:ModelName"],
+    }
+    templates: tuple[tuple[str, str], ...] = (
+        ("selfheal.config.json", json.dumps(starter_config, indent=2) + "\n"),
+        (".github/workflows/selfheal.yml", _STARTER_WORKFLOW_YML),
+    )
+
+    created: list[str] = []
+    skipped: list[str] = []
+    for rel_path, content in templates:
+        target = base_dir / rel_path
+        if target.exists() and not args.force:
+            skipped.append(rel_path)
+            continue
+        _atomic_write(target, content)
+        created.append(rel_path)
+
+    print(json.dumps({"created": created, "skipped": skipped}, indent=2))
+    return 0
+
+
+def _cmd_schema(args: argparse.Namespace) -> int:
+    """Emit JSON Schema, OpenAPI 3.1, or Zod preprocessor for a Pydantic model."""
+    try:
+        _, model_cls = _load_model_from_spec(args.model)
+    except (FileNotFoundError, ValueError, ImportError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    empty_plan = PatchPlan(model_name=model_cls.__name__, actions=())
+    if args.format == "jsonschema":
+        output = json.dumps(model_cls.model_json_schema(), indent=2) + "\n"
+    elif args.format == "openapi":
+        spec = emit_openapi_schema_patch(model_cls, empty_plan)
+        doc = emit_openapi_document([spec])
+        output = json.dumps(doc, indent=2) + "\n"
+    else:
+        output = synthesize_zod_preprocessor(empty_plan)
+
+    if args.out is not None:
+        _atomic_write(Path(args.out), output)
+    else:
+        print(output.rstrip("\n"))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -439,6 +555,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_doctor(args)
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "init":
+        return _cmd_init(args)
+    if args.command == "schema":
+        return _cmd_schema(args)
 
     try:
         model_path, model_cls = _load_model_from_spec(args.model)

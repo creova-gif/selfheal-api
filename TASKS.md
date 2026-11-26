@@ -48,3 +48,8 @@
 - [x] Deterministic performance benchmark suite for hot-path drift detection and normalization
 - [x] Python 3.12 / 3.13 CI matrix with `selfheal doctor --json` gate in `.github/workflows/ci.yml`
 - [x] Document ADR-008 (`docs/adr/008-durable-control-plane-persistence.md`), `TASKS.md`, and `CHANGELOG.md`
+
+## Wave 9: Milestone 9 — CLI Scaffolding & Schema Export
+- [x] Add `selfheal init` subcommand scaffolding `selfheal.config.json` and `.github/workflows/selfheal.yml` with `--dir` and `--force`
+- [x] Add `selfheal schema` subcommand exporting `jsonschema`, `openapi`, and `zod` formats with optional atomic `--out`
+- [x] Add deterministic unit tests in `tests/test_cli.py` and update `TASKS.md` and `CHANGELOG.md`

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import json
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -1177,3 +1180,120 @@ def test_head_healthz_and_readyz_probes() -> None:
             raise AssertionError("Expected 503 HTTPError")
         except urllib.error.HTTPError as exc:
             assert exc.code == 503
+
+
+def test_events_export_csv_and_jsonl_with_formula_neutralization() -> None:
+    with _running_server(ServerConfig()) as (server, base_url):
+        server.drift_ledger.record_event(
+            org_id="=evil/org",
+            model_name="=CMD('calc')",
+            fingerprint="+fp-1",
+            has_drift=True,
+            issue_count=2,
+            issue_kinds=("missing_field", "type_mismatch"),
+            pr_url="@https://example.com/pr/1",
+            created_at=1000.0,
+        )
+        server.drift_ledger.record_event(
+            org_id="=evil/org",
+            model_name="OrderPayload",
+            fingerprint="fp-2",
+            has_drift=False,
+            issue_count=0,
+            created_at=1001.0,
+        )
+
+        encoded_org = urllib.parse.quote("=evil/org", safe="")
+        with urllib.request.urlopen(
+            f"{base_url}/api/v1/events/export?org_id={encoded_org}&format=csv",
+            timeout=5.0,
+        ) as resp:
+            assert resp.status == 200
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            assert hdrs["content-type"] == "text/csv; charset=utf-8"
+            assert (
+                hdrs["content-disposition"]
+                == 'attachment; filename="drift-events-_evil_org.csv"'
+            )
+            assert hdrs["x-content-type-options"] == "nosniff"
+            assert hdrs["cache-control"] == "no-store"
+            assert hdrs.get("x-request-id")
+            csv_text = resp.read().decode("utf-8")
+
+        rows = list(csv.reader(io.StringIO(csv_text)))
+        assert rows[0] == [
+            "event_id",
+            "created_at",
+            "org_id",
+            "model_name",
+            "fingerprint",
+            "has_drift",
+            "issue_count",
+            "issue_kinds",
+            "pr_url",
+        ]
+        assert len(rows) == 3
+        # Ordered newest first: fp-2 then +fp-1
+        assert rows[1][2] == "'=evil/org"
+        assert rows[1][3] == "OrderPayload"
+        assert rows[2][2] == "'=evil/org"
+        assert rows[2][3] == "'=CMD('calc')"
+        assert rows[2][4] == "'+fp-1"
+        assert rows[2][7] == "missing_field,type_mismatch"
+        assert rows[2][8] == "'@https://example.com/pr/1"
+
+        with urllib.request.urlopen(
+            f"{base_url}/api/v1/events/export?org_id={encoded_org}&format=jsonl&model=OrderPayload",
+            timeout=5.0,
+        ) as resp:
+            assert resp.status == 200
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            assert hdrs["content-type"] == "application/x-ndjson; charset=utf-8"
+            assert (
+                hdrs["content-disposition"]
+                == 'attachment; filename="drift-events-_evil_org.jsonl"'
+            )
+            assert hdrs["x-content-type-options"] == "nosniff"
+            assert hdrs["cache-control"] == "no-store"
+            assert hdrs.get("x-request-id")
+            ndjson_lines = resp.read().decode("utf-8").strip().splitlines()
+
+        assert len(ndjson_lines) == 1
+        parsed = json.loads(ndjson_lines[0])
+        assert parsed["org_id"] == "=evil/org"
+        assert parsed["model_name"] == "OrderPayload"
+        assert parsed["fingerprint"] == "fp-2"
+
+
+def test_events_export_validation_and_tenant_auth() -> None:
+    config = ServerConfig(
+        tenants={"org-a": TenantConfig.model_validate({"webhook_secret": "s-export"})},
+        allow_unregistered_tenants=False,
+    )
+    with _running_server(config) as (_, base_url):
+        unauth_status, _, _ = _http_request(
+            f"{base_url}/api/v1/events/export?org_id=org-a"
+        )
+        assert unauth_status == 401
+
+        auth_headers = {"Authorization": "Bearer s-export"}
+        for bad_qs in (
+            "org_id=org-a&format=xml",
+            "org_id=org-a&limit=0",
+            "org_id=org-a&limit=1001",
+            "org_id=org-a&limit=abc",
+            "org_id=org-a&offset=-1",
+        ):
+            bad_status, _, _ = _http_request(
+                f"{base_url}/api/v1/events/export?{bad_qs}",
+                headers=auth_headers,
+            )
+            assert bad_status == 400
+
+        ok_req = urllib.request.Request(
+            f"{base_url}/api/v1/events/export?org_id=org-a",
+            headers=auth_headers,
+        )
+        with urllib.request.urlopen(ok_req, timeout=5.0) as resp:
+            assert resp.status == 200
+            assert "text/csv" in resp.headers.get("Content-Type", "")
