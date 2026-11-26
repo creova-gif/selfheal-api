@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 selfheal = "selfheal_api.cli:main"
+selfheal-server = "selfheal_api.server:main_server"
 
 [tool.setuptools.packages.find]
 where = ["src"]

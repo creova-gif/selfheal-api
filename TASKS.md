@@ -13,4 +13,6 @@
 
 ## Wave 3: Launch & Design Partner Validation
 - [x] Publish clean README with reproducible benchmark numbers
+- [x] Implement `EXP-1`–`EXP-5` (`selfheal` CLI, zero-PII `AnthropicSchemaMappingProvider`, `@selfheal_guard` + `DriftDeduplicator`, nested/list synthesis, TypeScript/Zod emitter)
+- [x] Implement Hosted Multi-Tenant Webhook Server (`python -m selfheal_api.server`, `/webhooks/drift`, `/healthz`) and Cloud Run `Dockerfile`
 - [ ] Run first external design-partner or open-source release

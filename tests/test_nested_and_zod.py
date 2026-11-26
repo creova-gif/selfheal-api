@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sentinel import DriftKind, detect_drift
 from synthesizer import synthesize_patch, synthesize_zod_preprocessor, verify_patch
+from synthesizer.patcher import build_patch_plan
 
 
 class BillingAddress(BaseModel):
@@ -195,3 +196,62 @@ def test_zod_preprocessor_handles_root_to_child_relocation() -> None:
     zod_ts = synthesize_zod_preprocessor(patch_res.plan)
     assert "normalized['billing']" in zod_ts
     assert "_parent_postal_code_0['postal_code'] = normalized['billing_postal_code']" in zod_ts
+
+
+def test_zod_preprocessor_handles_nullability_drift_and_list_str() -> None:
+    class _Notice(BaseModel):
+        title: str
+        count: int
+        tags: list[str]
+
+    drifted = {"title": None, "count": None, "tags": "urgent"}
+    report = detect_drift(_Notice, drifted)
+    plan = build_patch_plan(report, root_model=_Notice)
+    zod_ts = synthesize_zod_preprocessor(plan)
+
+    assert "if (normalized['title'] === null) {" in zod_ts
+    assert "normalized['title'] = '';" in zod_ts
+    assert "if (normalized['count'] === null) {" in zod_ts
+    assert "normalized['count'] = 0;" in zod_ts
+    assert "!Array.isArray(normalized['tags'])" in zod_ts
+    assert ".map((v) => String(v))" in zod_ts
+
+
+def test_zod_preprocessor_links_two_level_nested_models() -> None:
+    class Meta(BaseModel):
+        tag: str
+
+    class Item(BaseModel):
+        qty: int
+        meta: Meta
+
+    class Order(BaseModel):
+        order_id: str
+        items: list[Item]
+
+    drifted = {
+        "order_id": 1001,
+        "items": [
+            {"qty": "3", "meta": {"label": "gift"}},
+        ],
+    }
+    report = detect_drift(Order, drifted)
+    plan = build_patch_plan(report, root_model=Order)
+    zod_ts = synthesize_zod_preprocessor(plan)
+
+    assert "export function normalizeMetaDrift" in zod_ts
+    assert "export function normalizeItemDrift" in zod_ts
+    assert "export function normalizeOrderDrift" in zod_ts
+
+    # Verify normalizeItemDrift links to normalizeMetaDrift on normalized['meta']
+    item_section = zod_ts.split("export function normalizeItemDrift")[1].split(
+        "export function normalizeOrderDrift"
+    )[0]
+    assert "normalized['meta']" in item_section
+    assert "normalizeMetaDrift(" in item_section
+
+    # Verify normalizeOrderDrift links to normalizeItemDrift on normalized['items']
+    order_section = zod_ts.split("export function normalizeOrderDrift")[1]
+    assert "normalized['items']" in order_section
+    assert "normalizeItemDrift(" in order_section
+    assert "z.preprocess(normalizeOrderDrift, schema)" in order_section

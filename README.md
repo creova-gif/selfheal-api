@@ -22,6 +22,89 @@ Run the linter, strict type checker, and test suite in Python 3.12:
 .venv/bin/pytest -v
 ```
 
+## `selfheal` CLI
+
+Install the package (`pip install -e .`) to use the `selfheal` CLI:
+
+```bash
+# Detect schema drift and emit zero-PII DriftReport JSON (exit 0=clean, 1=drift, 2=error)
+selfheal check --model path/to/models.py:Invoice --payload drifted.json
+
+# Synthesize a libcst patch, run verify_patch + mypy --strict --shadow-file + pytest,
+# preview the unified diff, emit a TypeScript Zod adapter, write the patch, and open a PR
+selfheal heal \
+  --model path/to/models.py:Invoice \
+  --payload drifted.json \
+  --canonical canonical.json \
+  --diff \
+  --zod generated/invoice_adapter.ts \
+  --write \
+  --open-pr
+```
+
+Useful `heal` flags:
+- `--llm-fallback`: enable zero-PII `AnthropicSchemaMappingProvider` for opaque field renames.
+- `--pytest-args "..."`: pass extra arguments to the `pytest` verification gate.
+- `--branch <name>`: override the auto-generated `selfheal/<model>-<fingerprint>` branch name.
+
+## Runtime Guard & Zero-PII LLM Fallback
+
+Decorate sync or async boundary handlers with `@selfheal_guard` to detect drift in-process, deduplicate identical drift fingerprints, and optionally normalize incoming payloads (`normalize=True`):
+
+```python
+from sentinel.guard import DriftDeduplicator, selfheal_guard
+from sentinel.llm_fallback import AnthropicSchemaMappingProvider
+
+dedup = DriftDeduplicator(max_fingerprints=1024)
+provider = AnthropicSchemaMappingProvider(max_calls=50)
+
+@selfheal_guard(
+    Invoice,
+    mapping_provider=provider,
+    deduplicator=dedup,
+    normalize=True,
+    on_drift=lambda report, fp: print(f"Drift detected ({fp[:8]}): {len(report.issues)} issues"),
+)
+async def handle_webhook(payload: dict[str, object]) -> Invoice:
+    return Invoice.model_validate(payload)
+```
+
+- **`DriftDeduplicator`**: Thread-safe LRU cache with single-flight in-progress coordination keyed by `compute_drift_fingerprint(report)`.
+- **`AnthropicSchemaMappingProvider(max_calls=...)`**: Sends only redacted `PrimitiveKind` schemas and field names (never raw scalar values), bounded by a per-instance `max_calls` budget.
+
+## TypeScript / Zod Adapter Emission
+
+Generate a typed TypeScript preprocessor alongside Python CST patches via `selfheal heal --zod <out.ts>` or programmatically with `synthesize_zod_preprocessor(plan)`:
+
+```python
+from synthesizer.zod_emitter import synthesize_zod_preprocessor
+
+ts_source = synthesize_zod_preprocessor(patch_result.plan)
+```
+
+The emitted module exports `normalize<ModelName>Drift(data: unknown)` and `createSelfHealZodAdapter<T extends z.ZodTypeAny>(schema: T)` (wrapping `z.preprocess(...)`):
+
+```ts
+import { z } from 'zod';
+import { createSelfHealZodAdapter } from './invoice_adapter';
+
+const InvoiceSchema = createSelfHealZodAdapter(
+  z.object({ id: z.string(), amount_cents: z.number().int() }),
+);
+```
+
+## Hosted Multi-Tenant Webhook Server
+
+Run the hosted webhook receiver locally or deploy to GCP Cloud Run using the repository `Dockerfile`:
+
+```bash
+python -m selfheal_api.server
+```
+
+Endpoints:
+- `GET /healthz`: liveness/readiness health check.
+- `POST /webhooks/drift`: multi-tenant drift ingestion and automated patch/PR dispatch endpoint.
+
 ## Reproducible benchmark numbers
 
 Measured on Python 3.12.12 (`pydantic 2.14.4`, `libcst 1.9.0`) across the 40-mutation benchmark suite simulating Stripe, HubSpot, and Weather API drift (`tests/test_drift_and_patch.py`):

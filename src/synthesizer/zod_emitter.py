@@ -214,10 +214,23 @@ def synthesize_zod_preprocessor(plan: PatchPlan) -> str:
     for action in plan.actions:
         grouped[action.target_model].append(action)
 
-    ordered_models = [m for m in grouped if m != plan.model_name]
-    if plan.model_name in grouped or not ordered_models:
-        ordered_models.append(plan.model_name)
+    model_paths: dict[str, tuple[str, ...]] = {plan.model_name: ()}
+    for model_name, actions in grouped.items():
+        if model_name == plan.model_name:
+            continue
+        for act in actions:
+            parent_path = act.nested_path or act.target_parent_path
+            if parent_path:
+                model_paths[model_name] = tuple(str(s) for s in parent_path)
+                break
 
+    ordered_models = sorted(
+        [m for m in grouped if m != plan.model_name],
+        key=lambda m: -len(model_paths.get(m, ())),
+    )
+    ordered_models.append(plan.model_name)
+
+    known_paths = set(model_paths.values())
     sections: list[str] = ["import { z } from 'zod';", ""]
     for model_name in ordered_models:
         actions = grouped.get(model_name, [])
@@ -232,32 +245,74 @@ def synthesize_zod_preprocessor(plan: PatchPlan) -> str:
         )
         for idx, action in enumerate(actions):
             sections.extend(_emit_ts_action_lines(action, action_idx=idx))
-        if model_name == plan.model_name:
+
+        my_path = model_paths.get(model_name)
+        if my_path is not None:
             child_links: dict[str, str] = {}
-            for other_model, other_actions in grouped.items():
-                if other_model == plan.model_name:
+            deep_links: list[tuple[tuple[str, ...], str]] = []
+            for other_model, other_path in model_paths.items():
+                if other_model == model_name or len(other_path) <= len(my_path):
                     continue
-                for act in other_actions:
-                    parent_path = act.nested_path or act.target_parent_path
-                    if len(parent_path) == 1:
-                        top_field = str(parent_path[0])
-                        child_links.setdefault(top_field, f"normalize{other_model}Drift")
-            for top_field, child_fn in child_links.items():
+                if other_path[: len(my_path)] != my_path:
+                    continue
+                rel_path = other_path[len(my_path) :]
+                child_fn = f"normalize{other_model}Drift"
+                if len(rel_path) == 1:
+                    child_links.setdefault(rel_path[0], child_fn)
+                else:
+                    has_intermediate = any(
+                        other_path[:k] in known_paths
+                        for k in range(len(my_path) + 1, len(other_path))
+                    )
+                    if not has_intermediate:
+                        deep_links.append((rel_path, child_fn))
+
+            for child_field, child_fn in child_links.items():
                 sections.append(
-                    f"  if (Array.isArray(normalized[{top_field!r}])) {{"
+                    f"  if (Array.isArray(normalized[{child_field!r}])) {{"
                 )
                 sections.append(
-                    f"    normalized[{top_field!r}] = "
-                    f"(normalized[{top_field!r}] as unknown[]).map((item) => {child_fn}(item));"
+                    f"    normalized[{child_field!r}] = "
+                    f"(normalized[{child_field!r}] as unknown[]).map((item) => {child_fn}(item));"
                 )
                 sections.append(
-                    f"  }} else if (typeof normalized[{top_field!r}] === 'object' "
-                    f"&& normalized[{top_field!r}] !== null) {{"
+                    f"  }} else if (typeof normalized[{child_field!r}] === 'object' "
+                    f"&& normalized[{child_field!r}] !== null) {{"
                 )
                 sections.append(
-                    f"    normalized[{top_field!r}] = {child_fn}(normalized[{top_field!r}]);"
+                    f"    normalized[{child_field!r}] = {child_fn}(normalized[{child_field!r}]);"
                 )
                 sections.append("  }")
+
+            for link_idx, (rel_path, child_fn) in enumerate(deep_links):
+                helper_name = f"_link_{link_idx}"
+                head_field = rel_path[0]
+                tail_json = "[" + ", ".join(repr(s) for s in rel_path[1:]) + "]"
+                sections.append(
+                    f"  const {helper_name} = (node: unknown, path: string[]): unknown => {{"
+                )
+                sections.append(f"    if (path.length === 0) return {child_fn}(node);")
+                sections.append(
+                    f"    if (Array.isArray(node)) "
+                    f"return node.map((item) => {helper_name}(item, path));"
+                )
+                sections.append("    if (typeof node === 'object' && node !== null) {")
+                sections.append("      const rec = { ...(node as Record<string, unknown>) };")
+                sections.append("      const [head, ...rest] = path;")
+                sections.append(
+                    f"      if (head in rec) rec[head] = {helper_name}(rec[head], rest);"
+                )
+                sections.append("      return rec;")
+                sections.append("    }")
+                sections.append("    return node;")
+                sections.append("  };")
+                sections.append(f"  if ({head_field!r} in normalized) {{")
+                sections.append(
+                    f"    normalized[{head_field!r}] = "
+                    f"{helper_name}(normalized[{head_field!r}], {tail_json});"
+                )
+                sections.append("  }")
+
         sections.append("  return normalized;")
         sections.append("}")
         sections.append("")

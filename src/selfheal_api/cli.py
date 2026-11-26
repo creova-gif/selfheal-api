@@ -319,14 +319,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write("".join(diff_lines))
 
     zod_path: Path | None = None
+    zod_existed = False
     if args.zod is not None:
         zod_path = Path(args.zod)
+        zod_existed = zod_path.exists()
         zod_code = synthesize_zod_preprocessor(patch_result.plan)
         _atomic_write(zod_path, zod_code)
 
     if args.open_pr:
         fp = compute_drift_fingerprint(report)
         branch = args.branch or f"selfheal/{model_cls.__name__.lower()}-{fp[:8]}"
+        orig_branch: str | None = None
+        try:
+            rev_proc = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            if rev_proc.returncode == 0:
+                candidate = rev_proc.stdout.strip()
+                if candidate and candidate != "HEAD":
+                    orig_branch = candidate
+        except (OSError, subprocess.TimeoutExpired):
+            orig_branch = None
+
         try:
             _open_github_pr(model_path, zod_path, branch, model_cls.__name__, fp)
         except (
@@ -335,6 +353,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             OSError,
             RuntimeError,
         ) as exc:
+            if not args.write:
+                if orig_branch is not None:
+                    try:
+                        chk = subprocess.run(
+                            ["git", "checkout", orig_branch],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if chk.returncode != 0:
+                            print(
+                                f"warning: failed to restore branch {orig_branch}: "
+                                f"{chk.stderr.strip()}",
+                                file=sys.stderr,
+                            )
+                    except (OSError, subprocess.TimeoutExpired) as chk_exc:
+                        print(
+                            f"warning: failed to restore branch {orig_branch}: {chk_exc}",
+                            file=sys.stderr,
+                        )
+                _atomic_write(model_path, source_code)
+                if zod_path is not None and not zod_existed:
+                    zod_path.unlink(missing_ok=True)
             print(f"pr creation failed: {exc}", file=sys.stderr)
             return 2
 

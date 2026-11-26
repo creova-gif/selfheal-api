@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 from selfheal_api.cli import main
+from synthesizer.patcher import VerificationResult
 
 MODEL_CODE = """from __future__ import annotations
 
@@ -181,3 +182,116 @@ def test_cli_heal_pytest_gate_runs_against_patched_model_and_rolls_back(
     assert observed_source_during_pytest
     assert "_selfheal_normalize_drift" in observed_source_during_pytest[0]
     assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+
+
+def test_cli_heal_canonical_missing_or_invalid_json_returns_2(tmp_path: Path) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+
+    missing_canonical = tmp_path / "does_not_exist.json"
+    rc_missing = main(
+        [
+            "heal",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--payload",
+            str(drifted_json),
+            "--canonical",
+            str(missing_canonical),
+        ]
+    )
+    assert rc_missing == 2
+
+    invalid_canonical = tmp_path / "invalid.json"
+    invalid_canonical.write_text("{not-json", encoding="utf-8")
+    rc_invalid = main(
+        [
+            "heal",
+            "--model",
+            f"{model_file}:PaymentEvent",
+            "--payload",
+            str(drifted_json),
+            "--canonical",
+            str(invalid_canonical),
+        ]
+    )
+    assert rc_invalid == 2
+
+
+def test_cli_heal_verify_patch_failure_returns_1(tmp_path: Path) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+
+    failed_ver = VerificationResult(
+        passed=False,
+        syntax_valid=True,
+        drifted_payload_valid=False,
+        legacy_payload_valid=True,
+        error_detail="simulated verification failure",
+    )
+    with patch("selfheal_api.cli.verify_patch", return_value=failed_ver):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+            ]
+        )
+    assert rc == 1
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+
+
+def test_cli_heal_open_pr_rolls_back_on_gh_failure_without_write(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+    zod_out = tmp_path / "payment.ts"
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        recorded_cmds.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd[:2] == ["git", "status"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M models.py\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="gh auth failed")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", return_value=(True, "1 passed")),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--zod",
+                str(zod_out),
+                "--open-pr",
+            ]
+        )
+
+    assert rc == 2
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+    assert not zod_out.exists()
+    assert ["git", "checkout", "main"] in recorded_cmds

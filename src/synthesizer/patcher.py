@@ -574,10 +574,48 @@ def _walk_and_apply(
         _walk_and_apply(node[seg], path_rest[1:], action)
 
 
+def _strip_value_for_annotation(value: Any, ann: Any) -> Any:
+    if ann is None:
+        return value
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return _strip_forbidden_extras(value, ann) if isinstance(value, dict) else value
+    origin = get_origin(ann)
+    if origin in (Union, UnionType):
+        for arg in get_args(ann):
+            if arg is type(None):
+                continue
+            stripped = _strip_value_for_annotation(value, arg)
+            if stripped is not value:
+                return stripped
+        return value
+    if origin is list and isinstance(value, list):
+        args = get_args(ann)
+        if args:
+            elem_ann = args[0]
+            return [_strip_value_for_annotation(item, elem_ann) for item in value]
+    return value
+
+
+def _strip_forbidden_extras(
+    data: dict[str, Any], model_cls: type[BaseModel]
+) -> dict[str, Any]:
+    """Recursively strip unknown keys from dicts whose BaseModel configures extra='forbid'."""
+    forbid = model_cls.model_config.get("extra") == "forbid"
+    fields = model_cls.model_fields
+    out: dict[str, Any] = {}
+    for key, val in data.items():
+        if key in fields:
+            out[key] = _strip_value_for_annotation(val, fields[key].annotation)
+        elif not forbid:
+            out[key] = val
+    return out
+
+
 def apply_patch_plan_in_memory(
     payload: dict[str, Any],
     plan: PatchPlan,
     allowed_fields: set[str] | frozenset[str] | None = None,
+    root_model: type[BaseModel] | None = None,
 ) -> dict[str, Any]:
     normalized: dict[str, Any] = copy.deepcopy(payload)
     for action in plan.actions:
@@ -585,6 +623,8 @@ def apply_patch_plan_in_memory(
             _apply_action_to_target(normalized, action, preserve_parent=True)
         elif action.nested_path:
             _walk_and_apply(normalized, action.nested_path, action)
+    if root_model is not None:
+        return _strip_forbidden_extras(normalized, root_model)
     if allowed_fields is not None:
         return {k: v for k, v in normalized.items() if k in allowed_fields}
     return normalized

@@ -163,13 +163,8 @@ def _normalize_raw_payload(
     model_cls: type[BaseModel],
     plan: PatchPlan,
 ) -> str | bytes | dict[str, Any]:
-    allowed = (
-        frozenset(model_cls.model_fields.keys())
-        if model_cls.model_config.get("extra") == "forbid"
-        else None
-    )
     if isinstance(raw_payload, dict):
-        return apply_patch_plan_in_memory(raw_payload, plan, allowed_fields=allowed)
+        return apply_patch_plan_in_memory(raw_payload, plan, root_model=model_cls)
     try:
         decoded = (
             raw_payload.decode("utf-8")
@@ -181,7 +176,7 @@ def _normalize_raw_payload(
         return raw_payload
     if not isinstance(parsed, dict):
         return raw_payload
-    norm_dict = apply_patch_plan_in_memory(parsed, plan, allowed_fields=allowed)
+    norm_dict = apply_patch_plan_in_memory(parsed, plan, root_model=model_cls)
     serialized = json.dumps(norm_dict)
     return serialized.encode("utf-8") if isinstance(raw_payload, bytes) else serialized
 
