@@ -4,10 +4,13 @@ import hashlib
 import hmac
 import json
 import re
+import sqlite3
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -41,55 +44,138 @@ class InstallationRecord(BaseModel):
 
 
 class InstallationRegistry:
-    """Thread-safe registry mapping org_id and installation_id to installations."""
+    """Thread-safe SQLite-backed registry mapping org_id and installation_id to installations."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | Path = ":memory:") -> None:
+        resolved_path = str(db_path)
+        if resolved_path != ":memory:" and not resolved_path.startswith("file:"):
+            Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+
         self._lock = threading.Lock()
-        self._by_org: dict[str, InstallationRecord] = {}
-        self._by_installation: dict[int, str] = {}
+        self._closed = False
+        self._conn = sqlite3.connect(resolved_path, check_same_thread=False)
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        with self._lock:
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS installations (
+                    installation_id INTEGER PRIMARY KEY,
+                    org_id TEXT NOT NULL UNIQUE,
+                    account_login TEXT NOT NULL,
+                    repositories_json TEXT NOT NULL,
+                    suspended INTEGER NOT NULL,
+                    installed_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.commit()
+
+    @staticmethod
+    def _row_to_record(row: tuple[Any, ...]) -> InstallationRecord:
+        raw_repos = json.loads(str(row[3]))
+        repos = tuple(str(item) for item in raw_repos) if isinstance(raw_repos, list) else ()
+        return InstallationRecord(
+            installation_id=int(row[0]),
+            org_id=str(row[1]),
+            account_login=str(row[2]),
+            repositories=repos,
+            suspended=bool(int(row[4])),
+        )
 
     def upsert(self, record: InstallationRecord) -> InstallationRecord:
         """Insert or replace an installation record."""
+        now = time.time()
+        repos_json = json.dumps(list(record.repositories))
+        suspended_int = 1 if record.suspended else 0
         with self._lock:
-            prev_org = self._by_installation.get(record.installation_id)
-            if prev_org is not None and prev_org != record.org_id:
-                self._by_org.pop(prev_org, None)
-
-            prev_record = self._by_org.get(record.org_id)
-            if prev_record is not None and prev_record.installation_id != record.installation_id:
-                self._by_installation.pop(prev_record.installation_id, None)
-
-            self._by_org[record.org_id] = record
-            self._by_installation[record.installation_id] = record.org_id
-            return record
+            self._conn.execute(
+                "DELETE FROM installations WHERE org_id = ? AND installation_id != ?",
+                (record.org_id, record.installation_id),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO installations (
+                    installation_id,
+                    org_id,
+                    account_login,
+                    repositories_json,
+                    suspended,
+                    installed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(installation_id) DO UPDATE SET
+                    org_id = excluded.org_id,
+                    account_login = excluded.account_login,
+                    repositories_json = excluded.repositories_json,
+                    suspended = excluded.suspended,
+                    installed_at = excluded.installed_at
+                """,
+                (
+                    record.installation_id,
+                    record.org_id,
+                    record.account_login,
+                    repos_json,
+                    suspended_int,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return record
 
     def list_org_ids(self) -> list[str]:
         with self._lock:
-            return sorted(self._by_org.keys())
+            rows = self._conn.execute(
+                "SELECT org_id FROM installations ORDER BY org_id ASC"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def remove(self, installation_id: int) -> InstallationRecord | None:
         """Remove an installation by installation_id, returning it if present."""
         with self._lock:
-            org_id = self._by_installation.pop(installation_id, None)
-            if org_id is None:
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE installation_id = ?
+                """,
+                (installation_id,),
+            ).fetchone()
+            if row is None:
                 return None
-            return self._by_org.pop(org_id, None)
+            self._conn.execute(
+                "DELETE FROM installations WHERE installation_id = ?",
+                (installation_id,),
+            )
+            self._conn.commit()
+        return self._row_to_record(row)
 
     def add_repositories(
         self, installation_id: int, repos: Iterable[str]
     ) -> InstallationRecord | None:
         """Add repositories to an existing installation, preserving order."""
         with self._lock:
-            org_id = self._by_installation.get(installation_id)
-            if org_id is None:
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE installation_id = ?
+                """,
+                (installation_id,),
+            ).fetchone()
+            if row is None:
                 return None
-            record = self._by_org.get(org_id)
-            if record is None:
-                return None
+            record = self._row_to_record(row)
             merged = tuple(dict.fromkeys([*record.repositories, *repos]))
             updated = record.model_copy(update={"repositories": merged})
-            self._by_org[org_id] = updated
-            return updated
+            self._conn.execute(
+                "UPDATE installations SET repositories_json = ? WHERE installation_id = ?",
+                (json.dumps(list(merged)), installation_id),
+            )
+            self._conn.commit()
+        return updated
 
     def remove_repositories(
         self, installation_id: int, repos: Iterable[str]
@@ -97,44 +183,93 @@ class InstallationRegistry:
         """Remove repositories from an existing installation."""
         to_remove = set(repos)
         with self._lock:
-            org_id = self._by_installation.get(installation_id)
-            if org_id is None:
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE installation_id = ?
+                """,
+                (installation_id,),
+            ).fetchone()
+            if row is None:
                 return None
-            record = self._by_org.get(org_id)
-            if record is None:
-                return None
+            record = self._row_to_record(row)
             remaining = tuple(r for r in record.repositories if r not in to_remove)
             updated = record.model_copy(update={"repositories": remaining})
-            self._by_org[org_id] = updated
-            return updated
+            self._conn.execute(
+                "UPDATE installations SET repositories_json = ? WHERE installation_id = ?",
+                (json.dumps(list(remaining)), installation_id),
+            )
+            self._conn.commit()
+        return updated
 
     def set_suspended(
         self, installation_id: int, suspended: bool
     ) -> InstallationRecord | None:
         """Update the suspended flag for an existing installation."""
         with self._lock:
-            org_id = self._by_installation.get(installation_id)
-            if org_id is None:
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE installation_id = ?
+                """,
+                (installation_id,),
+            ).fetchone()
+            if row is None:
                 return None
-            record = self._by_org.get(org_id)
-            if record is None:
-                return None
+            record = self._row_to_record(row)
             updated = record.model_copy(update={"suspended": suspended})
-            self._by_org[org_id] = updated
-            return updated
+            self._conn.execute(
+                "UPDATE installations SET suspended = ? WHERE installation_id = ?",
+                (1 if suspended else 0, installation_id),
+            )
+            self._conn.commit()
+        return updated
 
     def get_by_org(self, org_id: str) -> InstallationRecord | None:
         """Look up an installation record by org_id."""
         with self._lock:
-            return self._by_org.get(org_id)
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE org_id = ?
+                """,
+                (org_id,),
+            ).fetchone()
+        return self._row_to_record(row) if row is not None else None
 
     def get_by_installation(self, installation_id: int) -> InstallationRecord | None:
         """Look up an installation record by installation_id."""
         with self._lock:
-            org_id = self._by_installation.get(installation_id)
-            if org_id is None:
-                return None
-            return self._by_org.get(org_id)
+            row = self._conn.execute(
+                """
+                SELECT installation_id, org_id, account_login, repositories_json, suspended
+                FROM installations
+                WHERE installation_id = ?
+                """,
+                (installation_id,),
+            ).fetchone()
+        return self._row_to_record(row) if row is not None else None
+
+    def ping(self) -> bool:
+        """Check database connectivity, returning False if closed or on SQLite errors."""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._conn.execute("SELECT 1").fetchone()
+            except sqlite3.Error:
+                return False
+        return True
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        with self._lock:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
 
 
 def _extract_repo_names(raw_repos: Any) -> tuple[str, ...]:

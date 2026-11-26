@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 import threading
 import time
-from collections import OrderedDict
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -101,35 +102,141 @@ def verify_stripe_signature(
 
 
 class BillingStore:
-    """Thread-safe store for per-org subscriptions and bounded Stripe event deduplication."""
+    """Thread-safe SQLite-backed store for per-org subscriptions and Stripe event deduplication."""
 
-    _MAX_PROCESSED_EVENTS = 4096
+    _MAX_PROCESSED_EVENTS = 10_000
 
-    def __init__(self, *, max_events: int = _MAX_PROCESSED_EVENTS) -> None:
-        if max_events < 1:
-            raise ValueError("max_events must be >= 1")
+    def __init__(
+        self,
+        db_path: str | Path = ":memory:",
+        *,
+        max_processed_events: int = _MAX_PROCESSED_EVENTS,
+        max_events: int | None = None,
+    ) -> None:
+        resolved_max = max_events if max_events is not None else max_processed_events
+        if resolved_max < 1:
+            raise ValueError("max_processed_events must be >= 1")
+
+        resolved_path = str(db_path)
+        if resolved_path != ":memory:" and not resolved_path.startswith("file:"):
+            Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+
         self._lock = threading.Lock()
-        self._subscriptions: dict[str, SubscriptionState] = {}
-        self._processed_events: OrderedDict[str, None] = OrderedDict()
-        self._latest_event_created: dict[str, int] = {}
-        self._max_events = max_events
+        self._closed = False
+        self._max_events = resolved_max
+        self._conn = sqlite3.connect(resolved_path, check_same_thread=False)
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        with self._lock:
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    org_id TEXT PRIMARY KEY,
+                    tier TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    stripe_customer_id TEXT,
+                    stripe_subscription_id TEXT,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_org_map (
+                    customer_id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_watermarks (
+                    scope_key TEXT PRIMARY KEY,
+                    created_ts INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.commit()
 
     def get_subscription(self, org_id: str) -> SubscriptionState:
         with self._lock:
-            existing = self._subscriptions.get(org_id)
-            if existing is not None:
-                return existing.model_copy()
+            row = self._conn.execute(
+                """
+                SELECT org_id, tier, status, stripe_customer_id, stripe_subscription_id
+                FROM subscriptions
+                WHERE org_id = ?
+                """,
+                (org_id,),
+            ).fetchone()
+        if row is None:
             return SubscriptionState(org_id=org_id)
+        return SubscriptionState(
+            org_id=str(row[0]),
+            plan=PlanTier(str(row[1])),
+            status=str(row[2]),
+            stripe_customer_id=str(row[3]) if row[3] is not None else None,
+            stripe_subscription_id=str(row[4]) if row[4] is not None else None,
+        )
 
     def list_org_ids(self) -> list[str]:
         with self._lock:
-            return sorted(self._subscriptions.keys())
+            rows = self._conn.execute(
+                "SELECT org_id FROM subscriptions ORDER BY org_id ASC"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def upsert_subscription(self, state: SubscriptionState) -> SubscriptionState:
+        now = time.time()
         with self._lock:
-            stored = state.model_copy()
-            self._subscriptions[state.org_id] = stored
-            return stored.model_copy()
+            self._conn.execute(
+                """
+                INSERT INTO subscriptions (
+                    org_id,
+                    tier,
+                    status,
+                    stripe_customer_id,
+                    stripe_subscription_id,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(org_id) DO UPDATE SET
+                    tier = excluded.tier,
+                    status = excluded.status,
+                    stripe_customer_id = excluded.stripe_customer_id,
+                    stripe_subscription_id = excluded.stripe_subscription_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    state.org_id,
+                    state.plan.value,
+                    state.status,
+                    state.stripe_customer_id,
+                    state.stripe_subscription_id,
+                    now,
+                ),
+            )
+            if state.stripe_customer_id:
+                self._conn.execute(
+                    """
+                    INSERT INTO customer_org_map (customer_id, org_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(customer_id) DO UPDATE SET
+                        org_id = excluded.org_id
+                    """,
+                    (state.stripe_customer_id, state.org_id),
+                )
+            self._conn.commit()
+        return state.model_copy()
 
     def get_limits(self, org_id: str) -> PlanLimits:
         sub = self.get_subscription(org_id)
@@ -144,26 +251,70 @@ class BillingStore:
         subscription_id: str | None = None,
     ) -> str | None:
         with self._lock:
-            for org_id, state in self._subscriptions.items():
-                if subscription_id and state.stripe_subscription_id == subscription_id:
-                    return org_id
-                if customer_id and state.stripe_customer_id == customer_id:
-                    return org_id
+            if subscription_id:
+                row = self._conn.execute(
+                    """
+                    SELECT org_id FROM subscriptions
+                    WHERE stripe_subscription_id = ?
+                    LIMIT 1
+                    """,
+                    (subscription_id,),
+                ).fetchone()
+                if row is not None:
+                    return str(row[0])
+            if customer_id:
+                row = self._conn.execute(
+                    """
+                    SELECT org_id FROM subscriptions
+                    WHERE stripe_customer_id = ?
+                    LIMIT 1
+                    """,
+                    (customer_id,),
+                ).fetchone()
+                if row is not None:
+                    return str(row[0])
+                map_row = self._conn.execute(
+                    """
+                    SELECT org_id FROM customer_org_map
+                    WHERE customer_id = ?
+                    LIMIT 1
+                    """,
+                    (customer_id,),
+                ).fetchone()
+                if map_row is not None:
+                    return str(map_row[0])
             return None
 
     def mark_event_processed(self, event_id: str) -> bool:
         """Record `event_id` if unseen. Returns True if new, False if duplicate."""
         with self._lock:
-            if event_id in self._processed_events:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO processed_events (event_id) VALUES (?)",
+                (event_id,),
+            )
+            if cursor.rowcount == 0:
                 return False
-            self._processed_events[event_id] = None
-            if len(self._processed_events) > self._max_events:
-                self._processed_events.popitem(last=False)
+            self._conn.execute(
+                """
+                DELETE FROM processed_events
+                WHERE seq NOT IN (
+                    SELECT seq FROM processed_events
+                    ORDER BY seq DESC
+                    LIMIT ?
+                )
+                """,
+                (self._max_events,),
+            )
+            self._conn.commit()
             return True
 
     def is_event_processed(self, event_id: str) -> bool:
         with self._lock:
-            return event_id in self._processed_events
+            row = self._conn.execute(
+                "SELECT 1 FROM processed_events WHERE event_id = ? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            return row is not None
 
     def is_stale_event(
         self,
@@ -176,12 +327,18 @@ class BillingStore:
         if created is None:
             return False
         with self._lock:
-            org_ts = self._latest_event_created.get(f"org:{org_id}")
-            if org_ts is not None and created < org_ts:
+            org_row = self._conn.execute(
+                "SELECT created_ts FROM event_watermarks WHERE scope_key = ?",
+                (f"org:{org_id}",),
+            ).fetchone()
+            if org_row is not None and created < int(org_row[0]):
                 return True
             if subscription_id:
-                sub_ts = self._latest_event_created.get(f"sub:{subscription_id}")
-                if sub_ts is not None and created < sub_ts:
+                sub_row = self._conn.execute(
+                    "SELECT created_ts FROM event_watermarks WHERE scope_key = ?",
+                    (f"sub:{subscription_id}",),
+                ).fetchone()
+                if sub_row is not None and created < int(sub_row[0]):
                     return True
             return False
 
@@ -196,15 +353,44 @@ class BillingStore:
         if created is None:
             return
         with self._lock:
-            org_key = f"org:{org_id}"
-            self._latest_event_created[org_key] = max(
-                self._latest_event_created.get(org_key, created), created
+            self._conn.execute(
+                """
+                INSERT INTO event_watermarks (scope_key, created_ts)
+                VALUES (?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    created_ts = MAX(event_watermarks.created_ts, excluded.created_ts)
+                """,
+                (f"org:{org_id}", created),
             )
             if subscription_id:
-                sub_key = f"sub:{subscription_id}"
-                self._latest_event_created[sub_key] = max(
-                    self._latest_event_created.get(sub_key, created), created
+                self._conn.execute(
+                    """
+                    INSERT INTO event_watermarks (scope_key, created_ts)
+                    VALUES (?, ?)
+                    ON CONFLICT(scope_key) DO UPDATE SET
+                        created_ts = MAX(event_watermarks.created_ts, excluded.created_ts)
+                    """,
+                    (f"sub:{subscription_id}", created),
                 )
+            self._conn.commit()
+
+    def ping(self) -> bool:
+        """Check database connectivity, returning False if closed or on SQLite errors."""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._conn.execute("SELECT 1").fetchone()
+            except sqlite3.Error:
+                return False
+        return True
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        with self._lock:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
 
 
 def _parse_plan_tier(raw: Any) -> PlanTier | None:
