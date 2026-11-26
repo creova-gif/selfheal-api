@@ -1,0 +1,11 @@
+# Default code ownership for SelfHealAPI
+* @creova-gif
+
+# Security, CI/CD, and Deployment Paths
+/.github/ @creova-gif
+/Dockerfile @creova-gif
+/deploy/ @creova-gif
+/SECURITY.md @creova-gif
+/src/selfheal_api/server.py @creova-gif
+/src/selfheal_api/billing.py @creova-gif
+/src/selfheal_api/github_app.py @creova-gif
