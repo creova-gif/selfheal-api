@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import inspect
@@ -43,6 +44,29 @@ def compute_drift_fingerprint(report: DriftReport) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _resolve_future(fut: asyncio.Future[None]) -> None:
+    if not fut.done():
+        fut.set_result(None)
+
+
+class _InFlightEntry:
+    __slots__ = ("async_waiters", "event")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.async_waiters: list[
+            tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]
+        ] = []
+
+    def notify_all(self) -> None:
+        self.event.set()
+        for loop, fut in self.async_waiters:
+            if not loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_resolve_future, fut)
+        self.async_waiters.clear()
+
+
 class DriftDeduplicator:
     def __init__(self, max_fingerprints: int = 1024) -> None:
         if max_fingerprints < 1:
@@ -50,22 +74,65 @@ class DriftDeduplicator:
         self._max_fingerprints = max_fingerprints
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, PatchPlan | None] = OrderedDict()
-        self._in_flight: dict[str, threading.Event] = {}
+        self._in_flight: dict[str, _InFlightEntry] = {}
+
+    def reserve(
+        self, fingerprint: str
+    ) -> tuple[bool, PatchPlan | _InFlightEntry | None]:
+        """Non-blocking reservation: returns (True, None) if caller owns resolution,
+        (False, plan) if already cached, or (False, entry) if another caller is in-flight.
+        """
+        with self._lock:
+            if fingerprint in self._seen:
+                self._seen.move_to_end(fingerprint)
+                return False, self._seen[fingerprint]
+            if fingerprint in self._in_flight:
+                return False, self._in_flight[fingerprint]
+            self._in_flight[fingerprint] = _InFlightEntry()
+            return True, None
 
     def begin(self, fingerprint: str) -> tuple[bool, PatchPlan | None]:
         while True:
-            event: threading.Event | None = None
+            is_owner, result = self.reserve(fingerprint)
+            if is_owner:
+                return True, None
+            if isinstance(result, _InFlightEntry):
+                result.event.wait()
+                continue
+            return False, result
+
+    async def begin_async(
+        self, fingerprint: str, *, timeout: float | None = None
+    ) -> tuple[bool, PatchPlan | None]:
+        """Async reservation that waits without occupying an executor thread."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
+        while True:
             with self._lock:
                 if fingerprint in self._seen:
                     self._seen.move_to_end(fingerprint)
                     return False, self._seen[fingerprint]
-                if fingerprint in self._in_flight:
-                    event = self._in_flight[fingerprint]
-                else:
-                    self._in_flight[fingerprint] = threading.Event()
+                if fingerprint not in self._in_flight:
+                    self._in_flight[fingerprint] = _InFlightEntry()
                     return True, None
-            if event is not None:
-                event.wait()
+                entry = self._in_flight[fingerprint]
+                fut = loop.create_future()
+                entry.async_waiters.append((loop, fut))
+            try:
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Timed out waiting for drift deduplication of {fingerprint[:8]}"
+                        )
+                    async with asyncio.timeout(remaining):
+                        await fut
+                else:
+                    await fut
+            finally:
+                with self._lock:
+                    with contextlib.suppress(ValueError):
+                        entry.async_waiters.remove((loop, fut))
 
     def complete(self, fingerprint: str, plan: PatchPlan) -> None:
         with self._lock:
@@ -73,15 +140,15 @@ class DriftDeduplicator:
             self._seen.move_to_end(fingerprint)
             if len(self._seen) > self._max_fingerprints:
                 self._seen.popitem(last=False)
-            ev = self._in_flight.pop(fingerprint, None)
-            if ev is not None:
-                ev.set()
+            entry = self._in_flight.pop(fingerprint, None)
+            if entry is not None:
+                entry.notify_all()
 
     def abort(self, fingerprint: str) -> None:
         with self._lock:
-            ev = self._in_flight.pop(fingerprint, None)
-            if ev is not None:
-                ev.set()
+            entry = self._in_flight.pop(fingerprint, None)
+            if entry is not None:
+                entry.notify_all()
 
     def check_and_record(self, fingerprint: str) -> bool:
         with self._lock:
@@ -163,13 +230,8 @@ def _normalize_raw_payload(
     model_cls: type[BaseModel],
     plan: PatchPlan,
 ) -> str | bytes | dict[str, Any]:
-    allowed = (
-        frozenset(model_cls.model_fields.keys())
-        if model_cls.model_config.get("extra") == "forbid"
-        else None
-    )
     if isinstance(raw_payload, dict):
-        return apply_patch_plan_in_memory(raw_payload, plan, allowed_fields=allowed)
+        return apply_patch_plan_in_memory(raw_payload, plan, root_model=model_cls)
     try:
         decoded = (
             raw_payload.decode("utf-8")
@@ -181,7 +243,7 @@ def _normalize_raw_payload(
         return raw_payload
     if not isinstance(parsed, dict):
         return raw_payload
-    norm_dict = apply_patch_plan_in_memory(parsed, plan, allowed_fields=allowed)
+    norm_dict = apply_patch_plan_in_memory(parsed, plan, root_model=model_cls)
     serialized = json.dumps(norm_dict)
     return serialized.encode("utf-8") if isinstance(raw_payload, bytes) else serialized
 
@@ -208,7 +270,7 @@ def selfheal_guard(
                     report = detect_drift(model_cls, raw_payload, mapping_provider=None)
                     if report.has_drift:
                         pre_fp = compute_drift_fingerprint(report)
-                        is_new, plan = await asyncio.to_thread(dedup.begin, pre_fp)
+                        is_new, plan = await dedup.begin_async(pre_fp)
                         if is_new:
                             try:
                                 enriched = (

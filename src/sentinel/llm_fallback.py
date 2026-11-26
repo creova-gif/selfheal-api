@@ -14,6 +14,10 @@ from typing import Any, Protocol, runtime_checkable
 _logger = logging.getLogger("selfheal_api")
 
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_UUID_RE = re.compile(
+    r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32})$"
+)
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _VALID_PRIMITIVE_VALUES: frozenset[str] = frozenset(
     {
@@ -33,7 +37,31 @@ _VALID_PRIMITIVE_VALUES: frozenset[str] = frozenset(
 
 
 def is_safe_key_segment(segment: str) -> bool:
-    return bool(_SAFE_KEY_RE.match(segment))
+    if not _SAFE_KEY_RE.match(segment):
+        return False
+    if segment.isdigit():
+        return False
+    if _UUID_RE.match(segment):
+        return False
+    return True
+
+
+def _is_safe_dot_key(dot_key: str) -> bool:
+    parts = dot_key.split(".")
+    if not parts:
+        return False
+    for part in parts:
+        if _EMAIL_RE.match(part) or _UUID_RE.match(part):
+            return False
+        if part.isdigit():
+            # Top-level digit-only keys or multi-digit IDs (>= 4 digits) are customer identifiers,
+            # whereas small nested numeric segments (e.g. "0", "1") represent list indices.
+            if len(parts) == 1 or len(part) >= 4:
+                return False
+            continue
+        if not is_safe_key_segment(part):
+            return False
+    return True
 
 
 def sanitize_candidate_paths(
@@ -119,6 +147,12 @@ class AnthropicSchemaMappingProvider:
         self._calls_made = 0
         self._lock = threading.Lock()
 
+    def set_max_calls(self, max_calls: int) -> None:
+        if max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
+        with self._lock:
+            self._max_calls = max_calls
+
     def resolve_opaque_mappings(
         self,
         model_name: str,
@@ -128,7 +162,10 @@ class AnthropicSchemaMappingProvider:
         for key, kind_val in extra_observed_kinds.items():
             if not is_valid_redacted_kind(kind_val):
                 raise ValueError(f"Unredacted value detected at {key!r}: {kind_val!r}")
-        if not self._api_key or not missing_fields or not extra_observed_kinds:
+        safe_extra_kinds = {
+            k: v for k, v in extra_observed_kinds.items() if _is_safe_dot_key(k)
+        }
+        if not self._api_key or not missing_fields or not safe_extra_kinds:
             return {}
         with self._lock:
             if self._calls_made >= self._max_calls:
@@ -145,7 +182,7 @@ class AnthropicSchemaMappingProvider:
             "to extra_path_key.\n"
             f"Model: {model_name}\n"
             f"Missing fields: {json.dumps(missing_fields)}\n"
-            f"Extra structural kinds: {json.dumps(extra_observed_kinds)}\n"
+            f"Extra structural kinds: {json.dumps(safe_extra_kinds)}\n"
         )
         body = json.dumps(
             {
@@ -193,7 +230,7 @@ class AnthropicSchemaMappingProvider:
                     isinstance(m_key, str)
                     and isinstance(e_key, str)
                     and m_key in missing_fields
-                    and e_key in extra_observed_kinds
+                    and e_key in safe_extra_kinds
                 ):
                     resolved[m_key] = tuple(
                         int(part) if part.isdigit() else part for part in e_key.split(".")

@@ -176,3 +176,73 @@ def test_guard_normalizes_json_str_and_bytes_payloads() -> None:
 
     assert handle_str('{"item_id": "15"}').item_id == 15
     assert handle_bytes(b'{"item_id": "25"}').item_id == 25
+
+
+def test_guard_strips_nested_forbidden_extras_in_child_and_list_models() -> None:
+    class _Meta(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        tag: str
+
+    class _Item(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        sku: str
+        meta: _Meta | None = None
+
+    class _Order(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        order_id: str
+        primary: _Item
+        items: list[_Item]
+
+    @selfheal_guard(_Order, normalize=True)
+    def handle(payload: dict[str, Any]) -> _Order:
+        return _Order.model_validate(payload, strict=True)
+
+    drifted: dict[str, Any] = {
+        "order_id": "ord-1",
+        "unknown_root": "drop-me",
+        "primary": {
+            "sku": "A1",
+            "unknown_primary": 123,
+            "meta": {"tag": "vip", "unknown_meta": True},
+        },
+        "items": [
+            {"sku": "B2", "unknown_item": "x", "meta": {"tag": "sale", "unknown_nested": 9}},
+        ],
+    }
+    out = handle(drifted)
+    assert out.order_id == "ord-1"
+    assert out.primary.sku == "A1"
+    assert out.primary.meta is not None and out.primary.meta.tag == "vip"
+    assert len(out.items) == 1
+    assert out.items[0].sku == "B2"
+    assert out.items[0].meta is not None and out.items[0].meta.tag == "sale"
+
+
+def test_guard_normalize_false_default_does_not_mutate_payload() -> None:
+    seen: list[dict[str, Any]] = []
+
+    @selfheal_guard(WebhookItem)
+    def handle(payload: dict[str, Any]) -> dict[str, Any]:
+        seen.append(payload)
+        return payload
+
+    raw: dict[str, Any] = {"id": "w1", "amount": "42", "extra_key": "keep"}
+    res = handle(raw)
+    assert res is raw
+    assert seen[0] == {"id": "w1", "amount": "42", "extra_key": "keep"}
+
+
+def test_guard_normalize_true_passes_through_malformed_utf8_and_invalid_json() -> None:
+    received: list[str | bytes] = []
+
+    @selfheal_guard(WebhookItem, normalize=True)
+    def handle(payload: str | bytes) -> str | bytes:
+        received.append(payload)
+        return payload
+
+    bad_utf8 = b"\xff\xfe\xfd"
+    bad_json = "{not valid json"
+    assert handle(bad_utf8) == bad_utf8
+    assert handle(bad_json) == bad_json
+    assert received == [bad_utf8, bad_json]

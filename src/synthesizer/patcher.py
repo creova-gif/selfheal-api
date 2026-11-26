@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from collections import defaultdict
 from types import UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Literal, Union, get_args, get_origin
 
 import libcst as cst
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -257,7 +257,10 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
             lines.append(f"if isinstance(normalized.get({f!r}), list):")
             comp = (
                 f"    normalized[{f!r}] = ["
-                f"int(float(item)) for item in normalized[{f!r}] "
+                f"(item if isinstance(item, int) else "
+                f"(int(item) if isinstance(item, str) and item.strip().lstrip('+-').isdigit() "
+                f"else int(float(item)))) "
+                f"for item in normalized[{f!r}] "
                 f"if not isinstance(item, bool) and isinstance(item, (int, float, str))]"
             )
             lines.append(comp)
@@ -286,7 +289,12 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
         )
         lines.append(cond)
         lines.append("    try:")
-        lines.append(f"        normalized[{f!r}] = int(float(normalized[{f!r}]))")
+        lines.append(
+            f"        normalized[{f!r}] = int(normalized[{f!r}]) "
+            f"if isinstance(normalized[{f!r}], str) "
+            f"and normalized[{f!r}].strip().lstrip('+-').isdigit() "
+            f"else int(float(normalized[{f!r}]))"
+        )
         lines.append("    except (ValueError, TypeError):")
         lines.append("        pass")
     elif "float" in exp_lower and "dict" not in exp_lower:
@@ -341,6 +349,41 @@ def _coercion_lines_for_action(action: PatchAction) -> list[str]:
         lines.append(f"        normalized[{f!r}] = str(normalized[{f!r}])")
 
     return lines
+
+
+def _update_model_config_expr(expr: cst.BaseExpression) -> cst.BaseExpression:
+    if (
+        isinstance(expr, cst.Call)
+        and isinstance(expr.func, cst.Name)
+        and expr.func.value == "ConfigDict"
+    ):
+        new_args: list[cst.Arg] = []
+        found_extra = False
+        for arg in expr.args:
+            if isinstance(arg.keyword, cst.Name) and arg.keyword.value == "extra":
+                found_extra = True
+                new_args.append(
+                    arg.with_changes(value=cst.SimpleString("'ignore'"))
+                )
+            else:
+                new_args.append(arg)
+        if not found_extra:
+            if new_args and new_args[-1].comma == cst.MaybeSentinel.DEFAULT:
+                new_args[-1] = new_args[-1].with_changes(
+                    comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                )
+            new_args.append(
+                cst.Arg(
+                    keyword=cst.Name("extra"),
+                    value=cst.SimpleString("'ignore'"),
+                    equal=cst.AssignEqual(
+                        whitespace_before=cst.SimpleWhitespace(""),
+                        whitespace_after=cst.SimpleWhitespace(""),
+                    ),
+                )
+            )
+        return expr.with_changes(args=tuple(new_args))
+    return cst.parse_expression("ConfigDict(extra='ignore')")
 
 
 def _build_validator_method_cst(actions: tuple[PatchAction, ...]) -> cst.FunctionDef:
@@ -469,7 +512,7 @@ class _ModelPatchTransformer(cst.CSTTransformer):
                         and assign_target.target.value == "model_config"
                     ):
                         small = small.with_changes(
-                            value=cst.parse_expression("ConfigDict(extra='ignore')")
+                            value=_update_model_config_expr(small.value)
                         )
             new_small_stmts.append(small)
         return line.with_changes(body=tuple(new_small_stmts))
@@ -539,6 +582,165 @@ def synthesize_patch(
     )
 
 
+def _default_value_for_type(expected_type: str) -> Any:
+    exp = expected_type.lower()
+    if "none" in exp:
+        return None
+    if exp.startswith("list"):
+        return []
+    if exp.startswith("dict"):
+        return {}
+    if exp == "bool":
+        return False
+    if exp == "int":
+        return 0
+    if exp == "float":
+        return 0.0
+    if exp == "str":
+        return ""
+    return None
+
+
+def _coerce_value_for_type(val: Any, expected_type: str) -> Any:
+    """Coerce a runtime value in pure Python to match ``expected_type``."""
+    exp_lower = expected_type.lower()
+
+    if "list[" in exp_lower:
+        items = ([] if val is None else [val]) if not isinstance(val, list) else val
+        if "list[str]" in exp_lower:
+            return [str(item) for item in items]
+        if "list[int]" in exp_lower:
+            return [
+                item
+                if isinstance(item, int)
+                else (
+                    int(item)
+                    if isinstance(item, str)
+                    and item.strip().lstrip("+-").isdigit()
+                    else int(float(item))
+                )
+                for item in items
+                if not isinstance(item, bool) and isinstance(item, (int, float, str))
+            ]
+        if "list[float]" in exp_lower:
+            return [
+                float(item)
+                for item in items
+                if not isinstance(item, bool) and isinstance(item, (int, float, str))
+            ]
+        if "list[bool]" in exp_lower:
+            return [
+                item.strip().lower() in ("true", "1", "yes")
+                if isinstance(item, str)
+                else bool(item)
+                for item in items
+            ]
+        return items
+
+    if "int" in exp_lower and "dict" not in exp_lower:
+        if isinstance(val, (str, float)) and not isinstance(val, bool):
+            try:
+                if isinstance(val, str) and val.strip().lstrip("+-").isdigit():
+                    return int(val)
+                return int(float(val))
+            except (ValueError, TypeError):
+                return val
+        return val
+
+    if "float" in exp_lower and "dict" not in exp_lower:
+        if isinstance(val, (str, int)) and not isinstance(val, bool):
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return val
+        return val
+
+    if "bool" in exp_lower:
+        if isinstance(val, str):
+            lowered = val.strip().lower()
+            if lowered in ("true", "1", "yes"):
+                return True
+            if lowered in ("false", "0", "no"):
+                return False
+        elif isinstance(val, int) and not isinstance(val, bool):
+            return bool(val)
+        return val
+
+    if exp_lower in ("str", "str | none"):
+        if val is not None and not isinstance(val, str):
+            if isinstance(val, dict):
+                for k in ("id", "code", "value", "name", "email", "address"):
+                    if k in val and isinstance(val[k], str):
+                        return val[k]
+                return str(val)
+            return str(val)
+        return val
+
+    return val
+
+
+def _extract_from_path(
+    root: dict[str, Any], source_path: tuple[str | int, ...]
+) -> tuple[bool, Any]:
+    if not source_path:
+        return False, None
+    curr: Any = root
+    for part in source_path[:-1]:
+        part_key = str(part)
+        if not isinstance(curr, dict):
+            return False, None
+        nxt = curr.get(part_key)
+        if not isinstance(nxt, dict):
+            return False, None
+        curr = nxt
+    last_key = str(source_path[-1])
+    if isinstance(curr, dict) and last_key in curr:
+        return True, curr[last_key]
+    return False, None
+
+
+def _apply_action_in_memory(target: dict[str, Any], action: PatchAction) -> None:
+    """Apply a single PatchAction in-place on its target dict without exec()."""
+    field = action.target_field
+    exp = action.expected_type
+    exp_lower = exp.lower()
+
+    if action.target_parent_path and action.source_path is not None:
+        curr: dict[str, Any] = target
+        for p_attr in action.target_parent_path:
+            p_key = str(p_attr)
+            existing = curr.get(p_key)
+            if not isinstance(existing, dict):
+                existing = {}
+                curr[p_key] = existing
+            curr = existing
+
+        if field not in curr:
+            found, extracted = _extract_from_path(target, action.source_path)
+            if found:
+                curr[field] = extracted
+
+        if field in curr:
+            curr[field] = _coerce_value_for_type(curr[field], exp)
+        return
+
+    if action.source_path is not None and field not in target:
+        found, extracted = _extract_from_path(target, action.source_path)
+        if found:
+            target[field] = extracted
+
+    if action.drift_kind == DriftKind.MISSING_FIELD and action.source_path is None:
+        if field not in target:
+            target[field] = _default_value_for_type(exp)
+
+    if action.drift_kind == DriftKind.NULLABILITY_DRIFT and "none" not in exp_lower:
+        if target.get(field) is None:
+            target[field] = _default_value_for_type(exp)
+
+    if field in target:
+        target[field] = _coerce_value_for_type(target[field], exp)
+
+
 def _apply_action_to_target(
     target: dict[str, Any], action: PatchAction, preserve_parent: bool = False
 ) -> None:
@@ -548,10 +750,7 @@ def _apply_action_to_target(
         if action.target_parent_path and not preserve_parent
         else action
     )
-    code_lines = _coercion_lines_for_action(local_action)
-    if code_lines:
-        scope: dict[str, Any] = {"normalized": target}
-        exec("\n".join(code_lines), {}, scope)
+    _apply_action_in_memory(target, local_action)
 
 
 def _walk_and_apply(
@@ -574,10 +773,88 @@ def _walk_and_apply(
         _walk_and_apply(node[seg], path_rest[1:], action)
 
 
+def _matches_literal_discriminator(
+    data: dict[str, Any], model_cls: type[BaseModel]
+) -> bool:
+    """Return True if at least one Literal-typed field in model_cls matches data[key]."""
+    matched = False
+    for fname, finfo in model_cls.model_fields.items():
+        if get_origin(finfo.annotation) is Literal:
+            if fname not in data:
+                return False
+            if data[fname] not in get_args(finfo.annotation):
+                return False
+            matched = True
+    return matched
+
+
+def _strip_value_for_annotation(value: Any, ann: Any) -> Any:
+    if ann is None:
+        return value
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return _strip_forbidden_extras(value, ann) if isinstance(value, dict) else value
+    origin = get_origin(ann)
+    if origin in (Union, UnionType):
+        non_none_args = [arg for arg in get_args(ann) if arg is not type(None)]
+        if len(non_none_args) == 1:
+            return _strip_value_for_annotation(value, non_none_args[0])
+        if isinstance(value, dict):
+            model_branches = [
+                arg
+                for arg in non_none_args
+                if isinstance(arg, type) and issubclass(arg, BaseModel)
+            ]
+            for branch in model_branches:
+                try:
+                    branch.model_validate(value)
+                    return value
+                except ValidationError:
+                    continue
+            valid_stripped: list[dict[str, Any]] = []
+            for branch in model_branches:
+                candidate = _strip_forbidden_extras(value, branch)
+                try:
+                    branch.model_validate(candidate)
+                    valid_stripped.append(candidate)
+                except ValidationError:
+                    continue
+            if len(valid_stripped) == 1:
+                return valid_stripped[0]
+            if not valid_stripped:
+                disc_branches = [
+                    b for b in model_branches if _matches_literal_discriminator(value, b)
+                ]
+                if len(disc_branches) == 1:
+                    return _strip_forbidden_extras(value, disc_branches[0])
+        return value
+    if origin is list and isinstance(value, list):
+        args = get_args(ann)
+        if args:
+            elem_ann = args[0]
+            return [_strip_value_for_annotation(item, elem_ann) for item in value]
+    return value
+
+
+def _strip_forbidden_extras(
+    data: dict[str, Any], model_cls: type[BaseModel]
+) -> dict[str, Any]:
+    """Recursively strip unknown keys from dicts whose BaseModel configures extra='forbid'."""
+    forbid = model_cls.model_config.get("extra") == "forbid"
+    fields = model_cls.model_fields
+    out: dict[str, Any] = {}
+    for key, val in data.items():
+        if key in fields:
+            out[key] = _strip_value_for_annotation(val, fields[key].annotation)
+        elif not forbid:
+            out[key] = val
+    return out
+
+
 def apply_patch_plan_in_memory(
     payload: dict[str, Any],
     plan: PatchPlan,
     allowed_fields: set[str] | frozenset[str] | None = None,
+    root_model: type[BaseModel] | None = None,
 ) -> dict[str, Any]:
     normalized: dict[str, Any] = copy.deepcopy(payload)
     for action in plan.actions:
@@ -585,6 +862,8 @@ def apply_patch_plan_in_memory(
             _apply_action_to_target(normalized, action, preserve_parent=True)
         elif action.nested_path:
             _walk_and_apply(normalized, action.nested_path, action)
+    if root_model is not None:
+        return _strip_forbidden_extras(normalized, root_model)
     if allowed_fields is not None:
         return {k: v for k, v in normalized.items() if k in allowed_fields}
     return normalized
