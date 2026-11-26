@@ -975,3 +975,22 @@ def test_paid_upgrade_via_stripe_immediately_updates_tenant_limits() -> None:
             f"{base_url}/webhooks/drift", "POST", drift_body, headers
         )
         assert post_upgrade_status == 200
+
+
+def test_security_headers_on_json_and_html_responses() -> None:
+    with _running_server(ServerConfig()) as (_server, base_url):
+        status, headers, _ = _http_request(f"{base_url}/healthz")
+        lower_h = {k.lower(): v for k, v in headers.items()}
+        assert status == 200
+        assert lower_h.get("x-content-type-options") == "nosniff"
+        assert lower_h.get("cache-control") == "no-store"
+
+        with urllib.request.urlopen(
+            f"{base_url}/dashboard?org_id=acme", timeout=5.0
+        ) as resp:
+            d_status = resp.status
+            lower_dh = {k.lower(): v for k, v in resp.headers.items()}
+        assert d_status == 200
+        assert lower_dh.get("x-content-type-options") == "nosniff"
+        assert lower_dh.get("x-frame-options") == "DENY"
+        assert "default-src 'none'" in (lower_dh.get("content-security-policy") or "")

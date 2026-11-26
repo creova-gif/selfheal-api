@@ -25,7 +25,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
 RUN groupadd --system --gid 10001 appuser && \
-    useradd --system --uid 10001 --gid appuser --no-create-home appuser
+    useradd --system --uid 10001 --gid appuser --no-create-home appuser && \
+    mkdir -p /data && chown appuser:appuser /data
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
@@ -33,5 +34,8 @@ COPY --from=builder /opt/venv /opt/venv
 USER appuser
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8080\")}/readyz', timeout=2)"
 
 CMD ["python", "-m", "selfheal_api.server"]

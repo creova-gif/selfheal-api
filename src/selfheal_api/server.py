@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import threading
 import time
 import uuid
@@ -354,6 +355,8 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Request-Id", self._get_request_id())
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -366,6 +369,8 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Request-Id", self._get_request_id())
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; style-src 'unsafe-inline'",
@@ -912,11 +917,20 @@ def main_server(argv: list[str] | None = None) -> int:
         host=host, port=port, config=config, model_registry=model_registry
     )
     _logger.info("Starting selfheal-server on %s:%d", host, port)
+    prev_sigterm: Any = None
+    if threading.current_thread() is threading.main_thread():
+        def _handle_sigterm(signum: int, _frame: Any) -> None:
+            _logger.info("Received signal %d; initiating graceful shutdown", signum)
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         _logger.info("Shutting down selfheal-server")
     finally:
+        if prev_sigterm is not None and threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, prev_sigterm)
         if hasattr(server, "drift_ledger"):
             server.drift_ledger.close()
         server.server_close()
