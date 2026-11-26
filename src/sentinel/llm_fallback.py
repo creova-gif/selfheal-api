@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -168,10 +169,15 @@ class AnthropicSchemaMappingProvider:
             with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
                 raw_resp = resp.read().decode("utf-8")
             payload: Any = json.loads(raw_resp)
+            if not isinstance(payload, dict):
+                return {}
             content_list = payload.get("content", [])
             if not isinstance(content_list, list) or not content_list:
                 return {}
-            text = content_list[0].get("text", "")
+            first_item = content_list[0]
+            if not isinstance(first_item, dict):
+                return {}
+            text = first_item.get("text", "")
             if not isinstance(text, str) or not text.strip():
                 return {}
             cleaned = text.strip()
@@ -195,9 +201,12 @@ class AnthropicSchemaMappingProvider:
             return resolved
         except (
             urllib.error.URLError,
+            http.client.HTTPException,
+            OSError,
             TimeoutError,
             json.JSONDecodeError,
             KeyError,
+            AttributeError,
             TypeError,
             ValueError,
         ) as exc:

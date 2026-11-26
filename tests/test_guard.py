@@ -160,3 +160,19 @@ def test_guard_nested_model_normalization_in_memory() -> None:
 
     out = handle({"name": "Ada", "addr": {"zip_code": "94107"}})
     assert out.addr.postal_code == "94107"
+
+
+def test_guard_normalizes_json_str_and_bytes_payloads() -> None:
+    class _Item(BaseModel):
+        item_id: int
+
+    @selfheal_guard(_Item, normalize=True)
+    def handle_str(payload: str) -> _Item:
+        return _Item.model_validate_json(payload, strict=True)
+
+    @selfheal_guard(_Item, normalize=True)
+    def handle_bytes(payload: bytes) -> _Item:
+        return _Item.model_validate_json(payload, strict=True)
+
+    assert handle_str('{"item_id": "15"}').item_id == 15
+    assert handle_bytes(b'{"item_id": "25"}').item_id == 25

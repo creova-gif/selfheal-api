@@ -297,10 +297,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     pytest_args = shlex.split(args.pytest_args) if args.pytest_args else []
-    pytest_ok, pytest_detail = _run_pytest_gate(pytest_args)
-    if not pytest_ok:
-        print(f"pytest gate failed:\n{pytest_detail}", file=sys.stderr)
-        return 1
+    keep_written = False
+    _atomic_write(model_path, patch_result.patched_source)
+    try:
+        pytest_ok, pytest_detail = _run_pytest_gate(pytest_args)
+        if not pytest_ok:
+            print(f"pytest gate failed:\n{pytest_detail}", file=sys.stderr)
+            return 1
+        keep_written = bool(args.write or args.open_pr)
+    finally:
+        if not keep_written:
+            _atomic_write(model_path, source_code)
 
     if args.diff:
         diff_lines = difflib.unified_diff(
@@ -316,9 +323,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         zod_path = Path(args.zod)
         zod_code = synthesize_zod_preprocessor(patch_result.plan)
         _atomic_write(zod_path, zod_code)
-
-    if args.write or args.open_pr:
-        _atomic_write(model_path, patch_result.patched_source)
 
     if args.open_pr:
         fp = compute_drift_fingerprint(report)

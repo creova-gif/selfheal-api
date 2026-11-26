@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
 from types import UnionType
 from typing import Any, Union, get_args, get_origin
@@ -519,11 +520,13 @@ def synthesize_patch(
     )
 
 
-def _apply_action_to_target(target: dict[str, Any], action: PatchAction) -> None:
+def _apply_action_to_target(
+    target: dict[str, Any], action: PatchAction, preserve_parent: bool = False
+) -> None:
     """Apply a single PatchAction in-place on its target dict."""
     local_action = (
         action.model_copy(update={"target_parent_path": ()})
-        if action.target_parent_path
+        if action.target_parent_path and not preserve_parent
         else action
     )
     code_lines = _coercion_lines_for_action(local_action)
@@ -556,10 +559,10 @@ def apply_patch_plan_in_memory(
     plan: PatchPlan,
     allowed_fields: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    normalized: dict[str, Any] = dict(payload)
+    normalized: dict[str, Any] = copy.deepcopy(payload)
     for action in plan.actions:
         if action.target_model == plan.model_name:
-            _apply_action_to_target(normalized, action)
+            _apply_action_to_target(normalized, action, preserve_parent=True)
         elif action.nested_path:
             _walk_and_apply(normalized, action.nested_path, action)
     if allowed_fields is not None:

@@ -144,3 +144,40 @@ def test_cli_heal_open_pr_invokes_git_commit_only_and_gh(tmp_path: Path) -> None
     assert rc == 0
     assert any(cmd[:3] == ["git", "commit", "--only"] for cmd in recorded_cmds)
     assert any(cmd[:3] == ["gh", "pr", "create"] for cmd in recorded_cmds)
+
+
+def test_cli_heal_pytest_gate_runs_against_patched_model_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+
+    observed_source_during_pytest: list[str] = []
+
+    def fake_pytest_gate(_args: list[str]) -> tuple[bool, str]:
+        observed_source_during_pytest.append(model_file.read_text(encoding="utf-8"))
+        return False, "1 failed"
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", side_effect=fake_pytest_gate),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--write",
+            ]
+        )
+
+    assert rc == 1
+    assert observed_source_during_pytest
+    assert "_selfheal_normalize_drift" in observed_source_during_pytest[0]
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE

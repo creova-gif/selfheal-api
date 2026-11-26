@@ -127,7 +127,7 @@ def _replace_payload_in_call(
     kwargs: dict[str, Any],
     mode: str,
     pos_idx: int | None,
-    new_payload: dict[str, Any],
+    new_payload: str | bytes | dict[str, Any],
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     if mode == "kwarg":
         updated_kwargs = dict(kwargs)
@@ -156,6 +156,34 @@ def _safe_invoke_callback(
             fingerprint[:8],
             exc,
         )
+
+
+def _normalize_raw_payload(
+    raw_payload: str | bytes | dict[str, Any],
+    model_cls: type[BaseModel],
+    plan: PatchPlan,
+) -> str | bytes | dict[str, Any]:
+    allowed = (
+        frozenset(model_cls.model_fields.keys())
+        if model_cls.model_config.get("extra") == "forbid"
+        else None
+    )
+    if isinstance(raw_payload, dict):
+        return apply_patch_plan_in_memory(raw_payload, plan, allowed_fields=allowed)
+    try:
+        decoded = (
+            raw_payload.decode("utf-8")
+            if isinstance(raw_payload, bytes)
+            else raw_payload
+        )
+        parsed = json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw_payload
+    if not isinstance(parsed, dict):
+        return raw_payload
+    norm_dict = apply_patch_plan_in_memory(parsed, plan, allowed_fields=allowed)
+    serialized = json.dumps(norm_dict)
+    return serialized.encode("utf-8") if isinstance(raw_payload, bytes) else serialized
 
 
 def selfheal_guard(
@@ -201,14 +229,9 @@ def selfheal_guard(
                             _safe_invoke_callback(
                                 on_drift, enriched, compute_drift_fingerprint(enriched)
                             )
-                        if normalize and isinstance(raw_payload, dict) and plan is not None:
-                            allowed = (
-                                frozenset(model_cls.model_fields.keys())
-                                if model_cls.model_config.get("extra") == "forbid"
-                                else None
-                            )
-                            norm_payload = apply_patch_plan_in_memory(
-                                raw_payload, plan, allowed_fields=allowed
+                        if normalize and plan is not None:
+                            norm_payload = _normalize_raw_payload(
+                                raw_payload, model_cls, plan
                             )
                             args_out, kwargs_out = _replace_payload_in_call(
                                 args, kwargs, mode, pos_idx, norm_payload
@@ -245,14 +268,9 @@ def selfheal_guard(
                         _safe_invoke_callback(
                             on_drift, enriched, compute_drift_fingerprint(enriched)
                         )
-                    if normalize and isinstance(raw_payload, dict) and plan is not None:
-                        allowed = (
-                            frozenset(model_cls.model_fields.keys())
-                            if model_cls.model_config.get("extra") == "forbid"
-                            else None
-                        )
-                        norm_payload = apply_patch_plan_in_memory(
-                            raw_payload, plan, allowed_fields=allowed
+                    if normalize and plan is not None:
+                        norm_payload = _normalize_raw_payload(
+                            raw_payload, model_cls, plan
                         )
                         args_out, kwargs_out = _replace_payload_in_call(
                             args, kwargs, mode, pos_idx, norm_payload
