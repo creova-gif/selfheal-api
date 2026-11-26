@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **EXP-4 (Nested & List Synthesis)**: Extended `libcst` patch synthesis to support nested sub-models and list-wrapped/coerced fields.
 - **EXP-5 (TypeScript/Zod Emitter)**: Added `synthesize_zod_preprocessor` emitting `normalize<ModelName>Drift` and `createSelfHealZodAdapter` (`z.preprocess` wrapper).
 - **Wave 3 (Hosted Webhook Server & Hardening)**: Added `python -m selfheal_api.server` with `/webhooks/drift` and `/healthz` endpoints and a Cloud Run `Dockerfile`.
+- **Milestone 4 (Ledger, Notifications, OpenAPI 3.1 & Drift Console)**: Added persistent zero-PII SQLite Drift Event Ledger (`src/selfheal_api/ledger.py`), zero-PII Slack/webhook notifier (`src/selfheal_api/notifier.py`), OpenAPI 3.1 `x-selfheal-aliases` emitter (`emit_openapi_schema_patch`, `emit_openapi_document`), and XSS-safe operator Drift Console (`GET /dashboard`, `GET /api/v1/events`, `GET /api/v1/summary`).
+- **Milestone 5 (ASGI/WSGI Middleware, Auto-Remediation & OpenAPI CLI)**: Added zero-dependency `SelfHealASGIMiddleware`, `SelfHealWSGIMiddleware`, and `RouteBinding` (`src/selfheal_api/middleware.py`), fail-closed `RemediationPipeline` (`src/selfheal_api/remediation.py`), and `--openapi` support in `selfheal heal`.
+- **Milestone 6 (Background Worker, Replay Harness & Public SDK)**: Added bounded non-blocking `RemediationQueue` background worker, zero-PII `run_replay_corpus` regression harness, public `selfheal_api` SDK `__all__` exports with `__version__ = "0.2.0"`, and `docs/adr/006-background-remediation-worker-and-replay-harness.md`.
 
 ## [0.1.0] - 2026-11-25
 

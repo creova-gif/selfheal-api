@@ -27,3 +27,9 @@
 - [x] Zero-dependency ASGI/WSGI schema-drift middleware (`SelfHealASGIMiddleware`, `SelfHealWSGIMiddleware`)
 - [x] Fail-closed `RemediationPipeline` orchestrating detection, CST synthesis, verification gates, and rollback
 - [x] `--openapi` CLI flag on `selfheal heal` emitting OpenAPI 3.1.0 `components.schemas` JSON with `x-selfheal-aliases` and rollback cleanup
+
+## Wave 6: Milestone 6 — Background Worker Queue, Replay Harness & SDK Exports
+- [x] Bounded non-blocking `RemediationQueue` background worker with fingerprint deduplication and graceful drain
+- [x] Zero-PII `run_replay_corpus` deterministic regression harness for CI evaluation
+- [x] Public `selfheal_api` SDK `__all__` exports and `__version__ = "0.2.0"`
+- [x] Document ADR-006 (`docs/adr/006-background-remediation-worker-and-replay-harness.md`), `TASKS.md`, and `CHANGELOG.md`
