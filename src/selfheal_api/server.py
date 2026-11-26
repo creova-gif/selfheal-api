@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -17,6 +15,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from selfheal_api.billing import BillingStore, handle_stripe_webhook
+from selfheal_api.github_app import (
+    InstallationRegistry,
+    handle_github_webhook,
+)
+from selfheal_api.github_app import (
+    verify_webhook_signature as verify_webhook_signature,
+)
 from sentinel.detector import detect_drift
 from sentinel.guard import DriftDeduplicator, compute_drift_fingerprint
 from sentinel.llm_fallback import AnthropicSchemaMappingProvider
@@ -33,6 +39,8 @@ class TenantConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     webhook_secret: str = ""
+    stripe_webhook_secret: str = ""
+    github_webhook_secret: str = ""
     max_requests_per_minute: int = Field(default=60, ge=1)
     max_llm_calls_per_tenant: int = Field(default=20, ge=0)
     max_fingerprints: int = Field(default=1024, ge=1)
@@ -45,6 +53,8 @@ class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=0, le=65535)
     webhook_secret: str = ""
+    stripe_webhook_secret: str = ""
+    github_webhook_secret: str = ""
     max_requests_per_minute: int = Field(default=60, ge=1)
     max_llm_calls_per_tenant: int = Field(default=20, ge=0)
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
@@ -145,20 +155,9 @@ class TenantRegistry:
         with self._lock:
             return self._tenants.get(org_id)
 
-
-def verify_webhook_signature(
-    secret: str, body: bytes, signature_header: str
-) -> bool:
-    """Verify HMAC-SHA256 webhook signature in `sha256=<hex>` format."""
-    if not secret or not signature_header:
-        return False
-    header = signature_header.strip()
-    if not header.lower().startswith("sha256="):
-        return False
-    provided_sig = f"sha256={header[7:].lower()}"
-    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    expected_sig = f"sha256={digest}"
-    return hmac.compare_digest(expected_sig, provided_sig)
+    def list_org_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._tenants.keys())
 
 
 class SelfHealHTTPServer(ThreadingHTTPServer):
@@ -172,10 +171,14 @@ class SelfHealHTTPServer(ThreadingHTTPServer):
         config: ServerConfig,
         registry: TenantRegistry,
         model_registry: Mapping[str, type[BaseModel]],
+        billing_store: BillingStore | None = None,
+        installation_registry: InstallationRegistry | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
         self.model_registry: dict[str, type[BaseModel]] = dict(model_registry)
+        self.billing_store = billing_store or BillingStore()
+        self.installation_registry = installation_registry or InstallationRegistry()
         super().__init__(server_address, RequestHandlerClass)
 
 
@@ -209,14 +212,63 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                 {"status": "ok", "version": SERVER_VERSION},
             )
             return
+        if path == "/metrics":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "version": SERVER_VERSION,
+                    "tenants_active": len(self.server.registry.list_org_ids()),
+                    "installations_active": len(
+                        self.server.installation_registry.list_org_ids()
+                    ),
+                    "subscriptions_active": len(
+                        self.server.billing_store.list_org_ids()
+                    ),
+                },
+            )
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path != "/webhooks/drift":
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        if path == "/webhooks/drift":
+            self._handle_drift_webhook()
             return
-        self._handle_drift_webhook()
+        if path == "/webhooks/stripe":
+            self._handle_stripe_webhook_route()
+            return
+        if path == "/webhooks/github":
+            self._handle_github_webhook_route()
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def _handle_stripe_webhook_route(self) -> None:
+        raw_body = self._read_body()
+        if raw_body is None:
+            return
+        sig_header = self.headers.get("Stripe-Signature", "")
+        code, payload = handle_stripe_webhook(
+            self.server.config.stripe_webhook_secret,
+            raw_body,
+            sig_header,
+            self.server.billing_store,
+        )
+        self._send_json(HTTPStatus(code), payload)
+
+    def _handle_github_webhook_route(self) -> None:
+        raw_body = self._read_body()
+        if raw_body is None:
+            return
+        sig_header = self.headers.get("X-Hub-Signature-256", "")
+        event_type = self.headers.get("X-GitHub-Event", "")
+        code, payload = handle_github_webhook(
+            self.server.config.github_webhook_secret,
+            raw_body,
+            sig_header,
+            event_type,
+            self.server.installation_registry,
+        )
+        self._send_json(HTTPStatus(code), payload)
 
     def _read_body(self) -> bytes | None:
         raw_len = self.headers.get("Content-Length")

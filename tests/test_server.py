@@ -347,3 +347,75 @@ def test_main_server_help_exits_zero() -> None:
     with pytest.raises(SystemExit) as exc_info:
         main_server(["--help"])
     assert exc_info.value.code == 0
+
+
+def test_server_stripe_github_and_metrics_routes() -> None:
+    import time
+
+    stripe_secret = "whsec_server_stripe"
+    github_secret = "ghsec_server_github"
+    cfg = ServerConfig(
+        stripe_webhook_secret=stripe_secret,
+        github_webhook_secret=github_secret,
+    )
+    with _running_server(cfg) as (server, base_url):
+        ts = int(time.time())
+        stripe_body = json.dumps(
+            {
+                "id": "evt_srv_1",
+                "type": "checkout.session.completed",
+                "data": {
+                    "object": {
+                        "client_reference_id": "org-stripe",
+                        "metadata": {"org_id": "org-stripe", "plan": "pro"},
+                    }
+                },
+            }
+        ).encode("utf-8")
+        stripe_sig = hmac.new(
+            stripe_secret.encode("utf-8"),
+            f"{ts}.".encode() + stripe_body,
+            hashlib.sha256,
+        ).hexdigest()
+        s_status, _, s_json = _http_request(
+            f"{base_url}/webhooks/stripe",
+            method="POST",
+            body=stripe_body,
+            headers={"Stripe-Signature": f"t={ts},v1={stripe_sig}"},
+        )
+        assert s_status == 200
+        assert s_json["plan"] == "pro"
+
+        gh_body = json.dumps(
+            {
+                "action": "created",
+                "installation": {
+                    "id": 9001,
+                    "account": {"login": "creova-gif"},
+                },
+                "repositories": [{"full_name": "creova-gif/selfheal-api"}],
+            }
+        ).encode("utf-8")
+        gh_sig = (
+            "sha256="
+            + hmac.new(
+                github_secret.encode("utf-8"), gh_body, hashlib.sha256
+            ).hexdigest()
+        )
+        g_status, _, g_json = _http_request(
+            f"{base_url}/webhooks/github",
+            method="POST",
+            body=gh_body,
+            headers={
+                "X-Hub-Signature-256": gh_sig,
+                "X-GitHub-Event": "installation",
+            },
+        )
+        assert g_status == 200
+        assert g_json["installation_id"] == 9001
+
+        m_status, _, m_json = _http_request(f"{base_url}/metrics")
+        assert m_status == 200
+        assert m_json["subscriptions_active"] == 1
+        assert m_json["installations_active"] == 1
+        assert server.billing_store.get_subscription("org-stripe").plan == "pro"
