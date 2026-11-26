@@ -21,6 +21,7 @@ class DashboardSnapshot(BaseModel, frozen=True):
     unique_fingerprints: int
     prs_opened: int
     recent_events: list[dict[str, Any]] = Field(default_factory=list)
+    status_filter: str = "all"
 
 
 def _esc(value: object) -> str:
@@ -363,6 +364,24 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
     .action-link:hover {{
       border-color: var(--accent);
     }}
+    .filter-bar {{
+      display: flex;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+    }}
+    .filter-link {{
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.75rem;
+    }}
+    .filter-link[aria-current="page"] {{
+      border-color: var(--accent);
+      color: var(--text);
+      background: var(--pr-bg);
+    }}
   </style>
 </head>
 <body>
@@ -417,6 +436,23 @@ def render_dashboard_html(snapshot: DashboardSnapshot) -> str:
     <section class="panel" aria-label="Recent Redacted Drift Events">
       <div class="panel-header">
         <h2 class="panel-title">Recent Redacted Drift Events</h2>
+        <nav class="filter-bar" aria-label="Filter events by status">
+          <a
+            class="filter-link"
+            href="/dashboard?org_id={org_q}&amp;status=all"
+            {"aria-current=\"page\"" if snapshot.status_filter == "all" else ""}
+          >All</a>
+          <a
+            class="filter-link"
+            href="/dashboard?org_id={org_q}&amp;status=drifted"
+            {"aria-current=\"page\"" if snapshot.status_filter == "drifted" else ""}
+          >Drifted</a>
+          <a
+            class="filter-link"
+            href="/dashboard?org_id={org_q}&amp;status=ok"
+            {"aria-current=\"page\"" if snapshot.status_filter == "ok" else ""}
+          >OK</a>
+        </nav>
       </div>
       <div class="table-wrap">
         <table>

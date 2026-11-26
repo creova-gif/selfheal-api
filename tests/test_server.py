@@ -1364,3 +1364,42 @@ def test_server_startup_prunes_events_when_retention_days_configured(
         server.billing_store.close()
         server.installation_registry.close()
         server.server_close()
+
+
+def test_dashboard_status_filter_and_validation() -> None:
+    with _running_server(ServerConfig()) as (server, base_url):
+        server.drift_ledger.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-drift-only",
+            has_drift=True,
+            issue_count=1,
+        )
+        server.drift_ledger.record_event(
+            org_id="acme",
+            model_name="Invoice",
+            fingerprint="fp-clean-only",
+            has_drift=False,
+            issue_count=0,
+        )
+
+        with urllib.request.urlopen(
+            f"{base_url}/dashboard?org_id=acme&status=drifted", timeout=5.0
+        ) as resp:
+            html_drifted = resp.read().decode("utf-8")
+            assert resp.status == 200
+            assert "fp-drift-only" in html_drifted
+            assert "fp-clean-only" not in html_drifted
+
+        with urllib.request.urlopen(
+            f"{base_url}/dashboard?org_id=acme&status=ok", timeout=5.0
+        ) as resp:
+            html_ok = resp.read().decode("utf-8")
+            assert resp.status == 200
+            assert "fp-clean-only" in html_ok
+            assert "fp-drift-only" not in html_ok
+
+        bad_status, _, _ = _http_request(
+            f"{base_url}/dashboard?org_id=acme&status=invalid"
+        )
+        assert bad_status == 400

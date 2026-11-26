@@ -710,10 +710,29 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
                 )
                 return
+            status_vals = query.get("status")
+            status_filter = (
+                status_vals[0].strip().lower()
+                if status_vals and status_vals[0].strip()
+                else "all"
+            )
+            if status_filter not in {"all", "drifted", "ok"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "status must be 'all', 'drifted', or 'ok'"},
+                )
+                return
             sub = self.server.billing_store.get_subscription(org_id)
             limits = self.server.billing_store.get_limits(org_id)
             summary = self.server.drift_ledger.get_org_summary(org_id)
-            events = self.server.drift_ledger.list_events(org_id=org_id, limit=15)
+            fetch_limit = 15 if status_filter == "all" else 100
+            events = self.server.drift_ledger.list_events(
+                org_id=org_id, limit=fetch_limit
+            )
+            if status_filter == "drifted":
+                events = [ev for ev in events if ev.has_drift][:15]
+            elif status_filter == "ok":
+                events = [ev for ev in events if not ev.has_drift][:15]
             snap = DashboardSnapshot(
                 org_id=org_id,
                 plan=str(sub.plan),
@@ -724,6 +743,7 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                 unique_fingerprints=summary.unique_fingerprints,
                 prs_opened=summary.prs_opened,
                 recent_events=[ev.model_dump(mode="json") for ev in events],
+                status_filter=status_filter,
             )
             self._send_html(HTTPStatus.OK, render_dashboard_html(snap))
             return

@@ -183,3 +183,21 @@ def test_render_dashboard_html_accessibility_and_export_links() -> None:
     assert ":focus-visible" in rendered
     assert "/api/v1/events/export?org_id=acme%2Fprod&amp;format=csv" in rendered
     assert "/api/v1/events/export?org_id=acme%2Fprod&amp;format=jsonl" in rendered
+
+
+def test_render_dashboard_html_status_filter_pills() -> None:
+    snapshot = DashboardSnapshot(
+        org_id="acme",
+        plan="pro",
+        requests_per_minute_limit=120,
+        llm_calls_limit=200,
+        total_events=2,
+        drifted_events=1,
+        unique_fingerprints=1,
+        prs_opened=0,
+        status_filter="drifted",
+    )
+    rendered = render_dashboard_html(snapshot)
+    assert 'aria-label="Filter events by status"' in rendered
+    assert 'href="/dashboard?org_id=acme&amp;status=drifted"' in rendered
+    assert 'aria-current="page"' in rendered
