@@ -23,7 +23,7 @@ Modern integrations break silently when upstream webhooks or REST APIs rename fi
 2. **Synthesizer (`src/synthesizer/patcher.py`)**: Transforms a `DriftReport` into a `PatchPlan` and applies a `libcst.CSTTransformer` to inject a typed `@model_validator(mode="before")` normalizer and safe union/literal widening without losing formatting.
 3. **Sandbox Gate (`verify_patch`)**: Parses the patched CST, executes the model in an isolated namespace, validates both the drifted payload and canonical legacy payload with `strict=True`, and enforces `mypy --strict` + `pytest` before any patch is written or PR is opened.
 
-- **Architecture & Threat Model:** See [`AGENTS.md`](AGENTS.md), [`docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md`](docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md), and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
+- **Architecture, Security & Threat Model:** See [`AGENTS.md`](AGENTS.md), [`SECURITY.md`](SECURITY.md), [`docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md`](docs/adr/001-redacted-ast-synthesis-and-sandbox-gate.md), and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Features
 
@@ -58,11 +58,23 @@ Run the quality gates locally:
 
 ## Usage
 
-### `selfheal` CLI (`check` & `heal`)
+### `selfheal` CLI (`init`, `check`, `heal`, `schema`, `replay`, `doctor`)
 
 ```bash
+# Scaffold starter selfheal.config.json and GitHub Actions workflow
+selfheal init
+
+# Verify Python, SQLite, dependencies, and toolchain readiness (zero-secret output)
+selfheal doctor --json
+
 # Detect schema drift and emit zero-PII DriftReport JSON (exit 0=clean, 1=drift, 2=error)
 selfheal check --model path/to/models.py:Invoice --payload drifted.json
+
+# Emit standalone JSON Schema, OpenAPI 3.1.0, or TypeScript/Zod from any Pydantic model
+selfheal schema --model path/to/models.py:Invoice --format openapi --out openapi.json
+
+# Replay a JSONL corpus against a Pydantic model
+selfheal replay --model path/to/models.py:Invoice --corpus samples.jsonl
 
 # Synthesize a libcst patch, run verify_patch + mypy --strict --shadow-file + pytest,
 # preview the unified diff, emit TypeScript Zod & OpenAPI 3.1 outputs, write, and open a PR
@@ -154,24 +166,34 @@ selfheal-server
 ```
 
 Endpoints:
-- `GET /healthz`: liveness/readiness health check.
-- `POST /webhooks/drift`: multi-tenant drift ingestion and automated patch/PR dispatch endpoint.
-- `GET /dashboard`: self-contained, XSS-safe HTML5 Drift Console displaying tenant quotas and recent redacted events.
-- `GET /api/v1/events` & `GET /api/v1/summary`: SQLite WAL zero-PII drift event ledger and aggregate telemetry APIs.
+- `GET /healthz` (`HEAD` supported): liveness probe.
+- `GET /readyz` (`HEAD` supported): readiness probe verifying `DriftLedger`, `BillingStore`, and `InstallationRegistry` SQLite health.
+- `GET /metrics` (`?format=prometheus`): JSON or Prometheus v0.0.4 telemetry metrics.
+- `GET /openapi.json`: live OpenAPI 3.1.0 specification including registered `model_registry` schemas.
+- `POST /webhooks/drift`: multi-tenant drift ingestion with HMAC verification, rate limiting, and Slack/webhook alerting.
+- `POST /webhooks/stripe` & `POST /webhooks/github`: Stripe billing and GitHub App installation webhook handlers.
+- `GET /dashboard`: WCAG 2.1 AA self-contained, CSP-strict HTML5 Drift Console with audit export links.
+- `GET /api/v1/events` (`?limit=...&offset=...&model=...`), `GET /api/v1/events/export` (`?format=csv|jsonl`), and `GET /api/v1/summary`: SQLite WAL zero-PII drift event ledger and audit export APIs.
 
 ## Configuration
 
-The hosted server (`src/selfheal_api/server.py`), Cloud Run manifest (`deploy/cloudrun.yaml`), and LLM fallback provider (`src/sentinel/llm_fallback.py`) read the following environment variables:
+See [`.env.example`](.env.example) for a starter template. The hosted server (`src/selfheal_api/server.py`), Cloud Run manifest (`deploy/cloudrun.yaml`), and LLM fallback provider (`src/sentinel/llm_fallback.py`) read the following environment variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8080` | HTTP listen port for `selfheal-server` / Cloud Run. |
 | `SELFHEAL_HOST` | `0.0.0.0` | Bind host address for `selfheal-server`. |
+| `SELFHEAL_DB_PATH` | `:memory:` | SQLite WAL persistence path (e.g. `/data/selfheal.db`) for ledger, billing, and installations. |
+| `SELFHEAL_RETENTION_DAYS` | `0` | Startup retention window in days (`> 0` prunes expired drift events on boot). |
+| `SELFHEAL_MODELS` | `""` | Comma-separated `module.path:ClassName` specs loaded at startup. |
 | `SELFHEAL_WEBHOOK_SECRET` | `""` | HMAC-SHA256 shared secret for `POST /webhooks/drift`. |
 | `STRIPE_WEBHOOK_SECRET` | `""` | Stripe webhook signing secret (falls back to `SELFHEAL_STRIPE_WEBHOOK_SECRET`). |
 | `GITHUB_APP_WEBHOOK_SECRET` | `""` | GitHub App webhook signing secret (falls back to `SELFHEAL_GITHUB_WEBHOOK_SECRET`). |
 | `SELFHEAL_MAX_RPM` | `60` | Per-tenant requests-per-minute rate limit. |
 | `SELFHEAL_MAX_LLM_CALLS` | `20` | Per-tenant cap on zero-PII LLM fallback calls. |
+| `SELFHEAL_SLACK_WEBHOOK_URL` | `""` | Optional `https://` Slack webhook URL for zero-PII drift alerts. |
+| `SELFHEAL_ALERT_WEBHOOK_URL` | `""` | Optional `https://` generic webhook URL for signed `DriftAlert` notifications. |
+| `SELFHEAL_ALERT_WEBHOOK_SECRET` | `""` | Optional HMAC-SHA256 secret (`X-SelfHeal-Signature`) for `SELFHEAL_ALERT_WEBHOOK_URL`. |
 | `ANTHROPIC_API_KEY` | `""` | API key for `AnthropicSchemaMappingProvider` when `--llm-fallback` is enabled. |
 
 ## Benchmarks
