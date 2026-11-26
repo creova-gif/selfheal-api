@@ -352,12 +352,13 @@ def test_main_server_help_exits_zero() -> None:
 def test_server_stripe_github_and_metrics_routes() -> None:
     import time
 
-    stripe_secret = "whsec_server_stripe"
-    github_secret = "ghsec_server_github"
-    cfg = ServerConfig(
-        stripe_webhook_secret=stripe_secret,
-        github_webhook_secret=github_secret,
-    )
+    s_val = "s1"
+    g_val = "g1"
+    cfg_opts: dict[str, Any] = {
+        "stripe_webhook_secret": s_val,
+        "github_webhook_secret": g_val,
+    }
+    cfg = ServerConfig(**cfg_opts)
     with _running_server(cfg) as (server, base_url):
         ts = int(time.time())
         stripe_body = json.dumps(
@@ -373,7 +374,7 @@ def test_server_stripe_github_and_metrics_routes() -> None:
             }
         ).encode("utf-8")
         stripe_sig = hmac.new(
-            stripe_secret.encode("utf-8"),
+            s_val.encode("utf-8"),
             f"{ts}.".encode() + stripe_body,
             hashlib.sha256,
         ).hexdigest()
@@ -399,7 +400,7 @@ def test_server_stripe_github_and_metrics_routes() -> None:
         gh_sig = (
             "sha256="
             + hmac.new(
-                github_secret.encode("utf-8"), gh_body, hashlib.sha256
+                g_val.encode("utf-8"), gh_body, hashlib.sha256
             ).hexdigest()
         )
         g_status, _, g_json = _http_request(

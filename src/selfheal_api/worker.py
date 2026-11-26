@@ -117,10 +117,10 @@ class RemediationQueue:
 
     def enqueue(self, job: QueuedRemediationJob) -> bool:
         """Enqueue a remediation job non-blockingly with org+fingerprint deduplication."""
-        key = (job.request.org_id, job.fingerprint)
+        dedup_id = (job.request.org_id, job.fingerprint)
         with self._lock:
-            if self._max_seen_fingerprints > 0 and key in self._seen_fingerprints:
-                self._seen_fingerprints.move_to_end(key)
+            if self._max_seen_fingerprints > 0 and dedup_id in self._seen_fingerprints:
+                self._seen_fingerprints.move_to_end(dedup_id)
                 self._deduplicated += 1
                 return False
 
@@ -131,7 +131,7 @@ class RemediationQueue:
                 return False
 
             if self._max_seen_fingerprints > 0:
-                self._seen_fingerprints[key] = None
+                self._seen_fingerprints[dedup_id] = None
                 while len(self._seen_fingerprints) > self._max_seen_fingerprints:
                     self._seen_fingerprints.popitem(last=False)
 

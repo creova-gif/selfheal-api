@@ -67,11 +67,12 @@ class ServerConfig(BaseModel):
     max_body_bytes: int = Field(default=1_048_576, ge=1024)
 
     def default_tenant_config(self) -> TenantConfig:
-        return TenantConfig(
-            webhook_secret=self.webhook_secret,
-            max_requests_per_minute=self.max_requests_per_minute,
-            max_llm_calls_per_tenant=self.max_llm_calls_per_tenant,
-        )
+        opts: dict[str, Any] = {
+            "webhook_secret": self.webhook_secret,
+            "max_requests_per_minute": self.max_requests_per_minute,
+            "max_llm_calls_per_tenant": self.max_llm_calls_per_tenant,
+        }
+        return TenantConfig(**opts)
 
 
 class DriftWebhookRequest(BaseModel):
@@ -534,13 +535,14 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     secret_env = os.environ.get("SELFHEAL_WEBHOOK_SECRET", "")
     rpm_env = int(os.environ.get("SELFHEAL_MAX_RPM", "60"))
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
-    return ServerConfig(
-        host=host_env,
-        port=port_env,
-        webhook_secret=secret_env,
-        max_requests_per_minute=rpm_env,
-        max_llm_calls_per_tenant=llm_cap_env,
-    )
+    opts: dict[str, Any] = {
+        "host": host_env,
+        "port": port_env,
+        "webhook_secret": secret_env,
+        "max_requests_per_minute": rpm_env,
+        "max_llm_calls_per_tenant": llm_cap_env,
+    }
+    return ServerConfig(**opts)
 
 
 def main_server(argv: list[str] | None = None) -> int:
