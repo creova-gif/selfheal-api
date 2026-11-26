@@ -12,4 +12,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]" && ruff check src tests && mypy --strict src tests && pytest -v && selfheal doctor --json
+      - run: pip install -e ".[dev]" && ruff check src tests && mypy --strict src tests && pytest -v && selfheal --version && selfheal doctor --json
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build -t selfheal-api:ci .
+      - name: Smoke-test container /healthz and /readyz
+        run: |
+          docker run -d --name selfheal-ci -p 18080:8080 -e SELFHEAL_DB_PATH=/data/selfheal.db selfheal-api:ci
+          trap "docker rm -f selfheal-ci" EXIT
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:18080/readyz; then
+              curl -fsS http://127.0.0.1:18080/healthz
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs selfheal-ci
+          exit 1
