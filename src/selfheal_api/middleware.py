@@ -98,12 +98,14 @@ class SelfHealASGIMiddleware:
         on_drift: Callable[[DriftReport, str], None] | None = None,
         mapping_provider: SchemaMappingProvider | None = None,
         deduplicator: DriftDeduplicator | None = None,
+        max_body_bytes: int = 1_048_576,
     ) -> None:
         self.app = app
         self._normalize = normalize
         self._on_drift = on_drift
         self._mapping_provider = mapping_provider
         self._deduplicator = deduplicator or DriftDeduplicator()
+        self._max_body_bytes = max_body_bytes
         self._route_index = _build_route_index(routes, default_normalize=normalize)
 
     async def __call__(
@@ -124,6 +126,7 @@ class SelfHealASGIMiddleware:
             return
 
         chunks: list[bytes] = []
+        total_bytes = 0
         more_body = True
         disconnect_msg: dict[str, Any] | None = None
         while more_body:
@@ -135,6 +138,22 @@ class SelfHealASGIMiddleware:
             if msg_type == "http.request":
                 chunk = message.get("body", b"")
                 if isinstance(chunk, (bytes, bytearray)):
+                    total_bytes += len(chunk)
+                    if total_bytes > self._max_body_bytes:
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 413,
+                                "headers": [(b"content-type", b"application/json")],
+                            }
+                        )
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": b'{"error":"request body too large"}',
+                            }
+                        )
+                        return
                     chunks.append(bytes(chunk))
                 more_body = bool(message.get("more_body", False))
 
@@ -195,12 +214,14 @@ class SelfHealWSGIMiddleware:
         on_drift: Callable[[DriftReport, str], None] | None = None,
         mapping_provider: SchemaMappingProvider | None = None,
         deduplicator: DriftDeduplicator | None = None,
+        max_body_bytes: int = 1_048_576,
     ) -> None:
         self.app = app
         self._normalize = normalize
         self._on_drift = on_drift
         self._mapping_provider = mapping_provider
         self._deduplicator = deduplicator or DriftDeduplicator()
+        self._max_body_bytes = max_body_bytes
         self._route_index = _build_route_index(routes, default_normalize=normalize)
 
     def __call__(
@@ -224,9 +245,22 @@ class SelfHealWSGIMiddleware:
                 content_length = int(raw_length)
             except (TypeError, ValueError):
                 content_length = 0
-            raw_body = wsgi_input.read(max(0, content_length))
+            if content_length < 0 or content_length > self._max_body_bytes:
+                status_str = (
+                    "413 Payload Too Large"
+                    if content_length > self._max_body_bytes
+                    else "400 Bad Request"
+                )
+                start_response(status_str, [("Content-Type", "application/json")])
+                return [b'{"error":"invalid or oversized body"}']
+            raw_body = wsgi_input.read(content_length)
         else:
-            raw_body = wsgi_input.read()
+            raw_body = wsgi_input.read(self._max_body_bytes + 1)
+            if len(raw_body) > self._max_body_bytes:
+                start_response(
+                    "413 Payload Too Large", [("Content-Type", "application/json")]
+                )
+                return [b'{"error":"request body too large"}']
 
         body = raw_body.encode("utf-8") if isinstance(raw_body, str) else bytes(raw_body)
         if body:

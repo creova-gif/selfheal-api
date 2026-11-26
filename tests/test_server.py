@@ -461,3 +461,42 @@ def test_server_ledger_notifier_api_and_dashboard() -> None:
             assert "SelfHealAPI Drift Console" in html_text
             assert "org-dash" in html_text
             assert "OrderPayload" in html_text
+            assert "DRIFTED" in html_text
+
+
+def test_tenant_read_endpoints_require_auth_and_error_codes() -> None:
+    cfg_opts: dict[str, Any] = {
+        "tenants": {
+            "org-a": TenantConfig.model_validate({"webhook_secret": "s-auth-a"}),
+        },
+        "allow_unregistered_tenants": False,
+        "max_body_bytes": 1024,
+    }
+    config = ServerConfig(**cfg_opts)
+    with _running_server(config) as (_, base_url):
+        for path in (
+            "/api/v1/events?org_id=org-a",
+            "/api/v1/summary?org_id=org-a",
+            "/dashboard?org_id=org-a",
+        ):
+            status, _, _ = _http_request(f"{base_url}{path}")
+            assert status == 401
+
+        auth_status, _, _ = _http_request(
+            f"{base_url}/api/v1/summary?org_id=org-a",
+            headers={"Authorization": "Bearer s-auth-a"},
+        )
+        assert auth_status == 200
+
+        oversized = b'{"model":"OrderPayload","payload":{"x":"' + (b"a" * 2048) + b'"}}'
+        os_sig = (
+            "sha256="
+            + hmac.new(b"s-auth-a", oversized, hashlib.sha256).hexdigest()
+        )
+        ov_status, _, _ = _http_request(
+            f"{base_url}/webhooks/drift",
+            method="POST",
+            body=oversized,
+            headers={"X-SelfHeal-Org": "org-a", "X-Hub-Signature-256": os_sig},
+        )
+        assert ov_status == 413

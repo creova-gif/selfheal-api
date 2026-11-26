@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,18 +136,20 @@ class TenantState:
 class TenantRegistry:
     """Thread-safe registry maintaining strict per-org_id isolation."""
 
-    def __init__(self, config: ServerConfig) -> None:
+    def __init__(self, config: ServerConfig, max_tenants: int = 4096) -> None:
         self._config = config
+        self._max_tenants = max_tenants
         self._lock = threading.Lock()
-        self._tenants: dict[str, TenantState] = {
-            org_id: TenantState(org_id=org_id, config=tenant_cfg)
+        self._tenants: OrderedDict[str, TenantState] = OrderedDict(
+            (org_id, TenantState(org_id=org_id, config=tenant_cfg))
             for org_id, tenant_cfg in config.tenants.items()
-        }
+        )
 
     def get_or_create(self, org_id: str) -> TenantState | None:
         with self._lock:
             existing = self._tenants.get(org_id)
             if existing is not None:
+                self._tenants.move_to_end(org_id)
                 return existing
             if not self._config.allow_unregistered_tenants:
                 return None
@@ -154,6 +158,8 @@ class TenantRegistry:
                 config=self._config.default_tenant_config(),
             )
             self._tenants[org_id] = state
+            while len(self._tenants) > self._max_tenants:
+                self._tenants.popitem(last=False)
             return state
 
     def get_tenant(self, org_id: str) -> TenantState | None:
@@ -193,6 +199,28 @@ class SelfHealHTTPServer(ThreadingHTTPServer):
 
 class SelfHealRequestHandler(BaseHTTPRequestHandler):
     server: SelfHealHTTPServer
+    timeout = 10.0
+
+    def _authorize_tenant_read(self, org_id: str) -> bool:
+        tenant = self.server.registry.get_tenant(org_id)
+        secret = (
+            tenant.config.webhook_secret
+            if tenant is not None
+            else self.server.config.webhook_secret
+        )
+        if not secret:
+            return True
+        auth_hdr = self.headers.get("Authorization", "").strip()
+        if auth_hdr.startswith("Bearer ") and hmac.compare_digest(
+            auth_hdr[7:].strip(), secret
+        ):
+            return True
+        sig_hdr = (
+            self.headers.get("X-Hub-Signature-256")
+            or self.headers.get("X-SelfHeal-Signature")
+            or ""
+        )
+        return verify_webhook_signature(secret, org_id.encode("utf-8"), sig_hdr)
 
     def log_message(self, format: str, *args: Any) -> None:
         _logger.info("%s - %s", self.address_string(), format % args)
@@ -259,6 +287,11 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/events":
             org_id = self._query_org_id(query)
+            if not self._authorize_tenant_read(org_id):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
+                )
+                return
             events = self.server.drift_ledger.list_events(org_id=org_id, limit=50)
             self._send_json(
                 HTTPStatus.OK,
@@ -270,11 +303,21 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/summary":
             org_id = self._query_org_id(query)
+            if not self._authorize_tenant_read(org_id):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
+                )
+                return
             summary = self.server.drift_ledger.get_org_summary(org_id)
             self._send_json(HTTPStatus.OK, summary.model_dump(mode="json"))
             return
         if path == "/dashboard":
             org_id = self._query_org_id(query)
+            if not self._authorize_tenant_read(org_id):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
+                )
+                return
             sub = self.server.billing_store.get_subscription(org_id)
             limits = self.server.billing_store.get_limits(org_id)
             summary = self.server.drift_ledger.get_org_summary(org_id)
@@ -371,6 +414,36 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        raw_body = self._read_body()
+        if raw_body is None:
+            return
+
+        existing_tenant = self.server.registry.get_tenant(org_id_raw)
+        if existing_tenant is None and not self.server.config.allow_unregistered_tenants:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": f"unknown organization: {org_id_raw}"},
+            )
+            return
+
+        expected_secret = (
+            existing_tenant.config.webhook_secret
+            if existing_tenant is not None
+            else self.server.config.webhook_secret
+        )
+        if expected_secret:
+            sig_header = (
+                self.headers.get("X-Hub-Signature-256")
+                or self.headers.get("X-SelfHeal-Signature")
+                or ""
+            )
+            if not verify_webhook_signature(expected_secret, raw_body, sig_header):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "invalid or missing webhook signature"},
+                )
+                return
+
         tenant = self.server.registry.get_or_create(org_id_raw)
         if tenant is None:
             self._send_json(
@@ -378,25 +451,6 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                 {"error": f"unknown organization: {org_id_raw}"},
             )
             return
-
-        raw_body = self._read_body()
-        if raw_body is None:
-            return
-
-        if tenant.config.webhook_secret:
-            sig_header = (
-                self.headers.get("X-Hub-Signature-256")
-                or self.headers.get("X-SelfHeal-Signature")
-                or ""
-            )
-            if not verify_webhook_signature(
-                tenant.config.webhook_secret, raw_body, sig_header
-            ):
-                self._send_json(
-                    HTTPStatus.UNAUTHORIZED,
-                    {"error": "invalid or missing webhook signature"},
-                )
-                return
 
         if not tenant.rate_limiter.allow():
             self._send_json(
@@ -438,24 +492,28 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        report = detect_drift(
-            expected_model,
-            req.payload,
-            mapping_provider=tenant.mapping_provider,
-        )
-        fingerprint = compute_drift_fingerprint(report)
+        pre_report = detect_drift(expected_model, req.payload, mapping_provider=None)
+        pre_fp = compute_drift_fingerprint(pre_report)
 
-        is_new, cached_plan = tenant.deduplicator.begin(fingerprint)
+        is_new, cached_plan = tenant.deduplicator.begin(pre_fp)
+        report = pre_report
         plan: PatchPlan | None = cached_plan
         if is_new:
             try:
+                if pre_report.has_drift and tenant.mapping_provider is not None:
+                    report = detect_drift(
+                        expected_model,
+                        req.payload,
+                        mapping_provider=tenant.mapping_provider,
+                    )
                 plan = build_patch_plan(report, root_model=expected_model)
-                tenant.deduplicator.complete(fingerprint, plan)
+                tenant.deduplicator.complete(pre_fp, plan)
             except Exception:
-                tenant.deduplicator.abort(fingerprint)
+                tenant.deduplicator.abort(pre_fp)
                 raise
         elif plan is None:
             plan = build_patch_plan(report, root_model=expected_model)
+        fingerprint = compute_drift_fingerprint(report)
 
         include_zod = (
             req.include_zod_adapter
@@ -533,12 +591,22 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     port_env = int(os.environ.get("PORT", "8080"))
     host_env = os.environ.get("SELFHEAL_HOST", "0.0.0.0")
     secret_env = os.environ.get("SELFHEAL_WEBHOOK_SECRET", "")
+    stripe_env = os.environ.get(
+        "STRIPE_WEBHOOK_SECRET",
+        os.environ.get("SELFHEAL_STRIPE_WEBHOOK_SECRET", ""),
+    )
+    github_env = os.environ.get(
+        "GITHUB_APP_WEBHOOK_SECRET",
+        os.environ.get("SELFHEAL_GITHUB_WEBHOOK_SECRET", ""),
+    )
     rpm_env = int(os.environ.get("SELFHEAL_MAX_RPM", "60"))
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
     opts: dict[str, Any] = {
         "host": host_env,
         "port": port_env,
         "webhook_secret": secret_env,
+        "stripe_webhook_secret": stripe_env,
+        "github_webhook_secret": github_env,
         "max_requests_per_minute": rpm_env,
         "max_llm_calls_per_tenant": llm_cap_env,
     }

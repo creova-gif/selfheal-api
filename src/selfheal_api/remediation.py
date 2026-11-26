@@ -118,13 +118,17 @@ class RemediationPipeline:
 
         limits = self.billing_store.get_limits(req.org_id)
         summary = self.drift_ledger.get_org_summary(req.org_id)
-        if summary.prs_opened >= limits.max_models:
+        distinct_models = set(summary.top_models.keys())
+        if (
+            req.model_name not in distinct_models
+            and len(distinct_models) >= limits.max_models
+        ) or summary.prs_opened >= limits.max_models:
             return RemediationOutcome(
                 status="rejected_quota",
                 fingerprint="",
                 detail=(
                     f"Quota exceeded for org {req.org_id!r}: "
-                    f"{summary.prs_opened}/{limits.max_models} PRs opened"
+                    f"{len(distinct_models)}/{limits.max_models} models"
                 ),
             )
 

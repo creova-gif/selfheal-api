@@ -73,8 +73,8 @@ def test_webhook_ping_without_secret() -> None:
         event_type="ping",
         registry=registry,
     )
-    assert status == 200
-    assert resp == {"status": "ok", "event": "ping", "zen": "Speak like a human."}
+    assert status == 401
+    assert "error" in resp
 
 
 def test_installation_lifecycle_created_suspend_unsuspend_deleted() -> None:

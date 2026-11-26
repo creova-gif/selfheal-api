@@ -161,7 +161,7 @@ def handle_github_webhook(
     registry: InstallationRegistry,
 ) -> tuple[int, dict[str, Any]]:
     """Verify and process a GitHub App webhook event."""
-    if secret and not verify_webhook_signature(secret, body, signature_header):
+    if not verify_webhook_signature(secret, body, signature_header):
         return 401, {"error": "Invalid webhook signature"}
 
     try:

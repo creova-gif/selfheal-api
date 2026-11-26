@@ -41,6 +41,13 @@ def _format_event_field_summary(event: dict[str, Any]) -> str:
     detail = event.get("detail") or event.get("summary")
     if detail and not parts:
         parts.append(_esc(detail))
+    if not parts and "issue_count" in event:
+        kinds = event.get("issue_kinds")
+        if isinstance(kinds, (list, tuple)) and kinds:
+            joined = ", ".join(_esc(k) for k in kinds)
+            parts.append(f"{_esc(event.get('issue_count', 0))} issues ({joined})")
+        else:
+            parts.append(f"{_esc(event.get('issue_count', 0))} issues")
     return "; ".join(parts) if parts else "—"
 
 
@@ -49,7 +56,7 @@ def _render_event_row(event: dict[str, Any]) -> str:
     timestamp = _esc(event.get("timestamp") or event.get("created_at") or "—")
     model_name = _esc(event.get("model_name") or "unknown")
     fingerprint = _esc(event.get("fingerprint") or "—")
-    drifted = bool(event.get("drifted", False))
+    drifted = bool(event.get("drifted", event.get("has_drift", False)))
     status_class = "status-drifted" if drifted else "status-ok"
     status_label = "DRIFTED" if drifted else "OK"
     pr_value = event.get("pr_url") or event.get("pr_number") or event.get("pr_opened")
