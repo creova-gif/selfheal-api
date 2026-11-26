@@ -123,7 +123,8 @@ def test_cli_heal_open_pr_invokes_git_commit_only_and_gh(tmp_path: Path) -> None
 
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         recorded_cmds.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        stdout = " M models.py\n" if cmd[:2] == ["git", "status"] else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
     with (
         patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),

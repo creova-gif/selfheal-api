@@ -23,10 +23,12 @@ def _ts_default_for_type(expected_type: str) -> str:
     return "null"
 
 
-def _emit_ts_action_lines(action: PatchAction) -> list[str]:
+def _emit_ts_action_lines(action: PatchAction, action_idx: int = 0) -> list[str]:
     f = action.target_field
     exp = action.expected_type.lower()
     lines: list[str] = []
+    v0 = f"_src_{f}_{action_idx}_0"
+    v1 = f"_src_{f}_{action_idx}_1"
 
     if action.source_path is not None:
         if len(action.source_path) == 1:
@@ -39,14 +41,14 @@ def _emit_ts_action_lines(action: PatchAction) -> list[str]:
         elif len(action.source_path) == 2:
             p0, p1 = str(action.source_path[0]), str(action.source_path[1])
             lines.append(
-                f"  const _src_{f}_0 = normalized[{p0!r}];"
+                f"  const {v0} = normalized[{p0!r}];"
             )
             lines.append(
-                f"  if (!({f!r} in normalized) && typeof _src_{f}_0 === 'object' "
-                f"&& _src_{f}_0 !== null && {p1!r} in _src_{f}_0) {{"
+                f"  if (!({f!r} in normalized) && typeof {v0} === 'object' "
+                f"&& {v0} !== null && {p1!r} in {v0}) {{"
             )
             lines.append(
-                f"    normalized[{f!r}] = (_src_{f}_0 as Record<string, unknown>)[{p1!r}];"
+                f"    normalized[{f!r}] = ({v0} as Record<string, unknown>)[{p1!r}];"
             )
             lines.append("  }")
         elif len(action.source_path) == 3:
@@ -55,20 +57,20 @@ def _emit_ts_action_lines(action: PatchAction) -> list[str]:
                 str(action.source_path[1]),
                 str(action.source_path[2]),
             )
-            lines.append(f"  const _src_{f}_0 = normalized[{p0!r}];")
+            lines.append(f"  const {v0} = normalized[{p0!r}];")
             lines.append(
-                f"  if (!({f!r} in normalized) && typeof _src_{f}_0 === 'object' "
-                f"&& _src_{f}_0 !== null && {p1!r} in _src_{f}_0) {{"
+                f"  if (!({f!r} in normalized) && typeof {v0} === 'object' "
+                f"&& {v0} !== null && {p1!r} in {v0}) {{"
             )
             lines.append(
-                f"    const _src_{f}_1 = (_src_{f}_0 as Record<string, unknown>)[{p1!r}];"
+                f"    const {v1} = ({v0} as Record<string, unknown>)[{p1!r}];"
             )
             lines.append(
-                f"    if (typeof _src_{f}_1 === 'object' && _src_{f}_1 !== null "
-                f"&& {p2!r} in _src_{f}_1) {{"
+                f"    if (typeof {v1} === 'object' && {v1} !== null "
+                f"&& {p2!r} in {v1}) {{"
             )
             lines.append(
-                f"      normalized[{f!r}] = (_src_{f}_1 as Record<string, unknown>)[{p2!r}];"
+                f"      normalized[{f!r}] = ({v1} as Record<string, unknown>)[{p2!r}];"
             )
             lines.append("    }")
             lines.append("  }")
@@ -201,8 +203,34 @@ def synthesize_zod_preprocessor(plan: PatchPlan) -> str:
             "  const normalized: Record<string, unknown> = "
             "{ ...(data as Record<string, unknown>) };"
         )
-        for action in actions:
-            sections.extend(_emit_ts_action_lines(action))
+        for idx, action in enumerate(actions):
+            sections.extend(_emit_ts_action_lines(action, action_idx=idx))
+        if model_name == plan.model_name:
+            child_links: dict[str, str] = {}
+            for other_model, other_actions in grouped.items():
+                if other_model == plan.model_name:
+                    continue
+                for act in other_actions:
+                    parent_path = act.nested_path or act.target_parent_path
+                    if parent_path:
+                        top_field = str(parent_path[0])
+                        child_links.setdefault(top_field, f"normalize{other_model}Drift")
+            for top_field, child_fn in child_links.items():
+                sections.append(
+                    f"  if (Array.isArray(normalized[{top_field!r}])) {{"
+                )
+                sections.append(
+                    f"    normalized[{top_field!r}] = "
+                    f"(normalized[{top_field!r}] as unknown[]).map((item) => {child_fn}(item));"
+                )
+                sections.append(
+                    f"  }} else if (typeof normalized[{top_field!r}] === 'object' "
+                    f"&& normalized[{top_field!r}] !== null) {{"
+                )
+                sections.append(
+                    f"    normalized[{top_field!r}] = {child_fn}(normalized[{top_field!r}]);"
+                )
+                sections.append("  }")
         sections.append("  return normalized;")
         sections.append("}")
         sections.append("")

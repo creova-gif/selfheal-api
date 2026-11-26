@@ -134,3 +134,48 @@ def test_anthropic_provider_rescues_timeout_and_malformed_json() -> None:
             )
             == {}
         )
+
+
+def test_anthropic_provider_enforces_call_cap_and_strips_fences() -> None:
+    import io
+
+    class _FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._buf = io.BytesIO(body)
+
+        def read(self) -> bytes:
+            return self._buf.read()
+
+        def __enter__(self) -> _FakeResp:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    fenced_body = json.dumps(
+        {
+            "content": [
+                {"text": "```json\n{\"customer_email\": \"x_party_ref\"}\n```"}
+            ]
+        }
+    ).encode("utf-8")
+
+    provider = AnthropicSchemaMappingProvider(api_key="test-key", max_calls=2)
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=[_FakeResp(fenced_body), _FakeResp(fenced_body)],
+    ) as mock_open:
+        first = provider.resolve_opaque_mappings(
+            "CustomerWebhook", {"customer_email": "str"}, {"x_party_ref": "<str>"}
+        )
+        second = provider.resolve_opaque_mappings(
+            "CustomerWebhook", {"customer_email": "str"}, {"x_party_ref": "<str>"}
+        )
+        third = provider.resolve_opaque_mappings(
+            "CustomerWebhook", {"customer_email": "str"}, {"x_party_ref": "<str>"}
+        )
+
+    assert first == {"customer_email": ("x_party_ref",)}
+    assert second == {"customer_email": ("x_party_ref",)}
+    assert third == {}
+    assert mock_open.call_count == 2

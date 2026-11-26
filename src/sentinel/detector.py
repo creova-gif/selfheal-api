@@ -338,6 +338,10 @@ def _type_compatible(expected_type: str, observed_kind: str) -> bool:
     exp = expected_type.lower()
     if observed_kind == PrimitiveKind.NULL:
         return "none" in exp
+    if "list" in exp:
+        return observed_kind == PrimitiveKind.EMPTY_LIST or observed_kind.startswith(
+            "list["
+        )
     if "int" in exp:
         return observed_kind in (
             PrimitiveKind.INT,
@@ -364,10 +368,6 @@ def _type_compatible(expected_type: str, observed_kind: str) -> bool:
             PrimitiveKind.INT_STR,
             PrimitiveKind.FLOAT_STR,
             PrimitiveKind.BOOL_STR,
-        )
-    if "list" in exp:
-        return observed_kind == PrimitiveKind.EMPTY_LIST or observed_kind.startswith(
-            "list["
         )
     return True
 
@@ -485,14 +485,10 @@ def detect_drift(
             loc_tuple: tuple[str | int, ...] = tuple(
                 int(x) if isinstance(x, int) else str(x) for x in err.get("loc", ())
             )
-            first_int_idx = next(
-                (i for i, seg in enumerate(loc_tuple) if isinstance(seg, int)),
-                None,
-            )
-            field_loc = (
-                loc_tuple[:first_int_idx]
-                if first_int_idx is not None and first_int_idx > 0
-                else loc_tuple
+            while len(loc_tuple) > 1 and isinstance(loc_tuple[-1], int):
+                loc_tuple = loc_tuple[:-1]
+            field_loc: tuple[str | int, ...] = tuple(
+                0 if isinstance(seg, int) else seg for seg in loc_tuple
             )
             found, observed_val = _lookup_path(parsed, field_loc)
             kind = _classify_validation_error(err, observed_val if found else None)

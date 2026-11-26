@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -105,11 +106,17 @@ class AnthropicSchemaMappingProvider:
         model: str = "claude-3-5-haiku-latest",
         timeout_s: float = 5.0,
         endpoint: str = "https://api.anthropic.com/v1/messages",
+        max_calls: int = 50,
     ) -> None:
+        if max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self._model = model
         self._timeout_s = timeout_s
         self._endpoint = endpoint
+        self._max_calls = max_calls
+        self._calls_made = 0
+        self._lock = threading.Lock()
 
     def resolve_opaque_mappings(
         self,
@@ -122,6 +129,14 @@ class AnthropicSchemaMappingProvider:
                 raise ValueError(f"Unredacted value detected at {key!r}: {kind_val!r}")
         if not self._api_key or not missing_fields or not extra_observed_kinds:
             return {}
+        with self._lock:
+            if self._calls_made >= self._max_calls:
+                _logger.warning(
+                    "AnthropicSchemaMappingProvider call cap (%d) reached; failing closed",
+                    self._max_calls,
+                )
+                return {}
+            self._calls_made += 1
 
         prompt = (
             "Map missing Pydantic model fields to candidate extra JSON paths using ONLY "
@@ -159,7 +174,11 @@ class AnthropicSchemaMappingProvider:
             text = content_list[0].get("text", "")
             if not isinstance(text, str) or not text.strip():
                 return {}
-            mapping_raw: Any = json.loads(text)
+            cleaned = text.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                cleaned = re.sub(r"\s*```$", "", cleaned)
+            mapping_raw: Any = json.loads(cleaned)
             if not isinstance(mapping_raw, dict):
                 return {}
             resolved: dict[str, tuple[str | int, ...]] = {}

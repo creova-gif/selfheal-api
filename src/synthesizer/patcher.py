@@ -20,6 +20,7 @@ class PatchAction(BaseModel):
     observed_kind: str
     source_path: tuple[str | int, ...] | None = None
     target_parent_path: tuple[str, ...] = ()
+    nested_path: tuple[str, ...] = ()
 
 
 class PatchPlan(BaseModel):
@@ -106,6 +107,7 @@ def build_patch_plan(
                         expected_type=issue.expected_type,
                         observed_kind=issue.observed_kind,
                         source_path=rel_src,
+                        nested_path=str_segments[:-1],
                     )
                 )
             else:
@@ -517,6 +519,38 @@ def synthesize_patch(
     )
 
 
+def _apply_action_to_target(target: dict[str, Any], action: PatchAction) -> None:
+    """Apply a single PatchAction in-place on its target dict."""
+    local_action = (
+        action.model_copy(update={"target_parent_path": ()})
+        if action.target_parent_path
+        else action
+    )
+    code_lines = _coercion_lines_for_action(local_action)
+    if code_lines:
+        scope: dict[str, Any] = {"normalized": target}
+        exec("\n".join(code_lines), {}, scope)
+
+
+def _walk_and_apply(
+    node: Any, path_rest: tuple[str | int, ...], action: PatchAction
+) -> None:
+    if not path_rest:
+        if isinstance(node, dict):
+            _apply_action_to_target(node, action)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, dict):
+                    _apply_action_to_target(item, action)
+        return
+    seg = path_rest[0]
+    if isinstance(seg, int) and isinstance(node, list):
+        for item in node:
+            _walk_and_apply(item, path_rest[1:], action)
+    elif isinstance(seg, str) and isinstance(node, dict) and seg in node:
+        _walk_and_apply(node[seg], path_rest[1:], action)
+
+
 def apply_patch_plan_in_memory(
     payload: dict[str, Any],
     plan: PatchPlan,
@@ -524,12 +558,10 @@ def apply_patch_plan_in_memory(
 ) -> dict[str, Any]:
     normalized: dict[str, Any] = dict(payload)
     for action in plan.actions:
-        if action.target_model != plan.model_name:
-            continue
-        scope: dict[str, Any] = {"normalized": normalized}
-        code_lines = _coercion_lines_for_action(action)
-        if code_lines:
-            exec("\n".join(code_lines), {}, scope)
+        if action.target_model == plan.model_name:
+            _apply_action_to_target(normalized, action)
+        elif action.nested_path:
+            _walk_and_apply(normalized, action.nested_path, action)
     if allowed_fields is not None:
         return {k: v for k, v in normalized.items() if k in allowed_fields}
     return normalized

@@ -50,6 +50,38 @@ class DriftDeduplicator:
         self._max_fingerprints = max_fingerprints
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, PatchPlan | None] = OrderedDict()
+        self._in_flight: dict[str, threading.Event] = {}
+
+    def begin(self, fingerprint: str) -> tuple[bool, PatchPlan | None]:
+        while True:
+            event: threading.Event | None = None
+            with self._lock:
+                if fingerprint in self._seen:
+                    self._seen.move_to_end(fingerprint)
+                    return False, self._seen[fingerprint]
+                if fingerprint in self._in_flight:
+                    event = self._in_flight[fingerprint]
+                else:
+                    self._in_flight[fingerprint] = threading.Event()
+                    return True, None
+            if event is not None:
+                event.wait()
+
+    def complete(self, fingerprint: str, plan: PatchPlan) -> None:
+        with self._lock:
+            self._seen[fingerprint] = plan
+            self._seen.move_to_end(fingerprint)
+            if len(self._seen) > self._max_fingerprints:
+                self._seen.popitem(last=False)
+            ev = self._in_flight.pop(fingerprint, None)
+            if ev is not None:
+                ev.set()
+
+    def abort(self, fingerprint: str) -> None:
+        with self._lock:
+            ev = self._in_flight.pop(fingerprint, None)
+            if ev is not None:
+                ev.set()
 
     def check_and_record(self, fingerprint: str) -> bool:
         with self._lock:
@@ -66,11 +98,7 @@ class DriftDeduplicator:
             return self._seen.get(fingerprint)
 
     def set_cached_plan(self, fingerprint: str, plan: PatchPlan) -> None:
-        with self._lock:
-            self._seen[fingerprint] = plan
-            self._seen.move_to_end(fingerprint)
-            if len(self._seen) > self._max_fingerprints:
-                self._seen.popitem(last=False)
+        self.complete(fingerprint, plan)
 
 
 def _extract_payload_from_call(
@@ -152,26 +180,27 @@ def selfheal_guard(
                     report = detect_drift(model_cls, raw_payload, mapping_provider=None)
                     if report.has_drift:
                         pre_fp = compute_drift_fingerprint(report)
-                        is_new = dedup.check_and_record(pre_fp)
-                        plan: PatchPlan | None = None
+                        is_new, plan = await asyncio.to_thread(dedup.begin, pre_fp)
                         if is_new:
-                            enriched = (
-                                await asyncio.to_thread(
-                                    detect_drift,
-                                    model_cls,
-                                    raw_payload,
-                                    mapping_provider,
+                            try:
+                                enriched = (
+                                    await asyncio.to_thread(
+                                        detect_drift,
+                                        model_cls,
+                                        raw_payload,
+                                        mapping_provider,
+                                    )
+                                    if mapping_provider is not None
+                                    else report
                                 )
-                                if mapping_provider is not None
-                                else report
-                            )
-                            plan = build_patch_plan(enriched, root_model=model_cls)
-                            dedup.set_cached_plan(pre_fp, plan)
+                                plan = build_patch_plan(enriched, root_model=model_cls)
+                                dedup.complete(pre_fp, plan)
+                            except BaseException:
+                                dedup.abort(pre_fp)
+                                raise
                             _safe_invoke_callback(
                                 on_drift, enriched, compute_drift_fingerprint(enriched)
                             )
-                        else:
-                            plan = dedup.get_cached_plan(pre_fp)
                         if normalize and isinstance(raw_payload, dict) and plan is not None:
                             allowed = (
                                 frozenset(model_cls.model_fields.keys())
@@ -198,23 +227,24 @@ def selfheal_guard(
                 report = detect_drift(model_cls, raw_payload, mapping_provider=None)
                 if report.has_drift:
                     pre_fp = compute_drift_fingerprint(report)
-                    is_new = dedup.check_and_record(pre_fp)
-                    plan: PatchPlan | None = None
+                    is_new, plan = dedup.begin(pre_fp)
                     if is_new:
-                        enriched = (
-                            detect_drift(
-                                model_cls, raw_payload, mapping_provider=mapping_provider
+                        try:
+                            enriched = (
+                                detect_drift(
+                                    model_cls, raw_payload, mapping_provider=mapping_provider
+                                )
+                                if mapping_provider is not None
+                                else report
                             )
-                            if mapping_provider is not None
-                            else report
-                        )
-                        plan = build_patch_plan(enriched, root_model=model_cls)
-                        dedup.set_cached_plan(pre_fp, plan)
+                            plan = build_patch_plan(enriched, root_model=model_cls)
+                            dedup.complete(pre_fp, plan)
+                        except BaseException:
+                            dedup.abort(pre_fp)
+                            raise
                         _safe_invoke_callback(
                             on_drift, enriched, compute_drift_fingerprint(enriched)
                         )
-                    else:
-                        plan = dedup.get_cached_plan(pre_fp)
                     if normalize and isinstance(raw_payload, dict) and plan is not None:
                         allowed = (
                             frozenset(model_cls.model_fields.keys())

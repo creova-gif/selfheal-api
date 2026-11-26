@@ -143,9 +143,18 @@ def _open_github_pr(
     )
     if status_proc.returncode != 0:
         raise RuntimeError(f"git status failed: {status_proc.stderr.strip()}")
+    if not status_proc.stdout.strip():
+        raise RuntimeError("No modified or untracked files to commit for PR")
 
     subprocess.run(
         ["git", "checkout", "-B", branch_name],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    subprocess.run(
+        ["git", "add", "--", *files_to_commit],
         check=True,
         capture_output=True,
         text=True,
@@ -158,6 +167,13 @@ def _open_github_pr(
         capture_output=True,
         text=True,
         timeout=15,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch_name],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     pr_body = (
         f"Automated schema-drift adapter patch for `{model_name}`.\n\n"

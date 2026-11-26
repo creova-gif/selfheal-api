@@ -149,3 +149,17 @@ def test_synthesize_zod_preprocessor_emits_per_model_normalizers() -> None:
     assert "export function normalizeOrderEventDrift" in zod_ts
     assert "export function createSelfHealZodAdapter" in zod_ts
     assert "z.preprocess(normalizeOrderEventDrift, schema)" in zod_ts
+    assert "normalizeBillingAddressDrift(" in zod_ts
+
+
+def test_list_of_nested_models_preserves_child_drift_path() -> None:
+    class _LineItem(BaseModel):
+        price: int
+
+    class _Cart(BaseModel):
+        items: list[_LineItem]
+
+    drifted = {"items": [{"price": "12"}]}
+    report = detect_drift(_Cart, drifted)
+    assert report.has_drift
+    assert any(i.path == ("items", 0, "price") for i in report.issues)
