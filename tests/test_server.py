@@ -19,6 +19,7 @@ from selfheal_api.server import (
     SelfHealHTTPServer,
     ServerConfig,
     TenantConfig,
+    TenantRegistry,
     _load_config_from_env_and_file,
     _load_model_registry,
     create_server,
@@ -779,3 +780,198 @@ def test_drift_webhook_internal_error_returns_500_with_request_id(
                 "request_id": "req-err-500",
             }
             assert any("req-err-500" in rec.message for rec in caplog.records)
+
+
+def test_server_config_model_specs_loaded_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = ServerConfig.model_validate(
+        {"model_specs": "selfheal_api.server:ServerConfig, selfheal_api.server:TenantConfig"}
+    )
+    assert cfg.model_specs == [
+        "selfheal_api.server:ServerConfig",
+        "selfheal_api.server:TenantConfig",
+    ]
+    srv = create_server(host="127.0.0.1", port=0, config=cfg)
+    try:
+        assert srv.model_registry == {
+            "ServerConfig": ServerConfig,
+            "TenantConfig": TenantConfig,
+        }
+    finally:
+        srv.drift_ledger.close()
+        srv.server_close()
+
+    cfg_file = tmp_path / "server.json"
+    cfg_file.write_text(
+        json.dumps({"model_specs": ["selfheal_api.server:ServerConfig"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SELFHEAL_MODELS", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    class _DummyServer:
+        def serve_forever(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            captured["closed"] = True
+
+    def _fake_create_server(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _DummyServer()
+
+    monkeypatch.setattr("selfheal_api.server.create_server", _fake_create_server)
+    assert main_server(["--config", str(cfg_file)]) == 0
+    assert captured["model_registry"] == {"ServerConfig": ServerConfig}
+
+
+def test_multitenant_read_isolation_blocks_shared_secret_fallback() -> None:
+    config = ServerConfig(
+        webhook_secret="shared-server-secret",
+        api_secret="shared-api-secret",
+        tenants={
+            "org-a": TenantConfig(api_secret="tenant-a-api-secret"),
+            "org-b": TenantConfig(webhook_secret="tenant-b-wh-secret"),
+        },
+        allow_unregistered_tenants=True,
+    )
+    with _running_server(config) as (_, base_url):
+        # org-a rejects shared server secrets and org-b's secret
+        for bad_secret in ("shared-server-secret", "shared-api-secret", "tenant-b-wh-secret"):
+            for path in (
+                "/api/v1/events?org_id=org-a",
+                "/api/v1/summary?org_id=org-a",
+                "/dashboard?org_id=org-a",
+            ):
+                status, _, _ = _http_request(
+                    f"{base_url}{path}",
+                    headers={"Authorization": f"Bearer {bad_secret}"},
+                )
+                assert status == 401
+
+        # org-a accepts ONLY its own api_secret
+        ok_status, _, _ = _http_request(
+            f"{base_url}/api/v1/events?org_id=org-a",
+            headers={"Authorization": "Bearer tenant-a-api-secret"},
+        )
+        assert ok_status == 200
+
+        # Unknown tenant in multi-tenant mode rejects shared server secret
+        unk_status, _, _ = _http_request(
+            f"{base_url}/api/v1/summary?org_id=org-unknown",
+            headers={"Authorization": "Bearer shared-api-secret"},
+        )
+        assert unk_status == 401
+
+    # Explicit allow_admin_read_bypass=True permits server_secret for unknown tenants
+    bypass_cfg = config.model_copy(update={"allow_admin_read_bypass": True})
+    with _running_server(bypass_cfg) as (_, base_url):
+        bypass_status, _, _ = _http_request(
+            f"{base_url}/api/v1/summary?org_id=org-unknown",
+            headers={"Authorization": "Bearer shared-api-secret"},
+        )
+        assert bypass_status == 200
+
+
+def test_tenant_registry_pinned_tenants_never_evicted() -> None:
+    cfg = ServerConfig(
+        tenants={"org-pinned": TenantConfig(webhook_secret="pinned-secret")},
+        allow_unregistered_tenants=True,
+    )
+    registry = TenantRegistry(cfg, max_tenants=3)
+
+    pinned = registry.get_tenant("org-pinned")
+    assert pinned is not None
+    assert pinned.pinned is True
+
+    # Admit 3 dynamic tenants into remaining capacity of 2 -> dyn-1 evicted, pinned kept
+    assert registry.get_or_create("dyn-1") is not None
+    assert registry.get_or_create("dyn-2") is not None
+    assert registry.get_or_create("dyn-3") is not None
+
+    assert registry.get_tenant("dyn-1") is None
+    assert registry.get_tenant("dyn-2") is not None
+    assert registry.get_tenant("dyn-3") is not None
+    still_pinned = registry.get_tenant("org-pinned")
+    assert still_pinned is pinned
+    assert still_pinned.config.webhook_secret == "pinned-secret"
+
+    # When all capacity is pinned, new dynamic tenants are rejected cleanly
+    full_registry = TenantRegistry(cfg, max_tenants=1)
+    assert full_registry.get_or_create("dyn-rejected") is None
+    assert full_registry.get_tenant("org-pinned") is not None
+
+
+def test_paid_upgrade_via_stripe_immediately_updates_tenant_limits() -> None:
+    import time
+
+    stripe_secret = "whsec_upgrade"
+    cfg = ServerConfig(
+        stripe_webhook_secret=stripe_secret,
+        tenants={
+            "org-up": TenantConfig(
+                max_requests_per_minute=2,
+                max_llm_calls_per_tenant=5,
+                enable_llm_fallback=True,
+            ),
+        },
+        allow_unregistered_tenants=False,
+    )
+    drift_body = json.dumps(
+        {
+            "model": "OrderPayload",
+            "payload": {
+                "order_id": 1,
+                "customer_email": "alice@example.com",
+                "total_cents": 100,
+            },
+        }
+    ).encode("utf-8")
+
+    with _running_server(cfg) as (server, base_url):
+        headers = {"Content-Type": "application/json", "X-SelfHeal-Org": "org-up"}
+        assert _http_request(f"{base_url}/webhooks/drift", "POST", drift_body, headers)[0] == 200
+        assert _http_request(f"{base_url}/webhooks/drift", "POST", drift_body, headers)[0] == 200
+        assert _http_request(f"{base_url}/webhooks/drift", "POST", drift_body, headers)[0] == 429
+
+        ts = int(time.time())
+        stripe_body = json.dumps(
+            {
+                "id": "evt_upgrade_1",
+                "type": "checkout.session.completed",
+                "created": ts,
+                "data": {
+                    "object": {
+                        "customer": "cus_up",
+                        "subscription": "sub_up",
+                        "metadata": {"org_id": "org-up", "plan": "pro"},
+                    }
+                },
+            }
+        ).encode("utf-8")
+        stripe_sig = hmac.new(
+            stripe_secret.encode("utf-8"),
+            f"{ts}.".encode() + stripe_body,
+            hashlib.sha256,
+        ).hexdigest()
+        s_status, _, _ = _http_request(
+            f"{base_url}/webhooks/stripe",
+            method="POST",
+            body=stripe_body,
+            headers={"Stripe-Signature": f"t={ts},v1={stripe_sig}"},
+        )
+        assert s_status == 200
+
+        # Immediately after Stripe upgrade, tenant limits reflect PRO (120 rpm, 200 LLM calls)
+        tenant = server.registry.get_tenant("org-up")
+        assert tenant is not None
+        assert tenant.rate_limiter._capacity == 120.0
+        assert tenant.mapping_provider is not None
+        assert tenant.mapping_provider._max_calls == 200
+
+        post_upgrade_status, _, _ = _http_request(
+            f"{base_url}/webhooks/drift", "POST", drift_body, headers
+        )
+        assert post_upgrade_status == 200

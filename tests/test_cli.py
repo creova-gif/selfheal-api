@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from selfheal_api.cli import main
-from synthesizer.patcher import VerificationResult
+from synthesizer.patcher import PatchPlan, PatchResult, VerificationResult
 
 MODEL_CODE = """from __future__ import annotations
 
@@ -566,3 +568,155 @@ def test_cli_doctor_human_readable_and_missing_dep_returns_1(
     data = json.loads(capsys.readouterr().out)
     assert data["healthy"] is False
     assert data["packages"]["libcst"] == {"available": False, "version": None}
+
+
+def test_cli_heal_diff_only_preserves_crlf_bytes_and_mode(
+    tmp_path: Path, capsys: Any
+) -> None:
+    crlf_bytes = MODEL_CODE.replace("\n", "\r\n").encode("utf-8")
+    model_file = tmp_path / "models.py"
+    model_file.write_bytes(crlf_bytes)
+    os.chmod(model_file, 0o755)
+
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": "250"}), encoding="utf-8"
+    )
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", return_value=(True, "1 passed")),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--diff",
+            ]
+        )
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "--- a/models.py" in stdout
+    assert "+++ b/models.py" in stdout
+    assert model_file.read_bytes() == crlf_bytes
+    assert stat.S_IMODE(model_file.stat().st_mode) == 0o755
+
+
+def test_cli_heal_noop_does_not_open_pr(tmp_path: Path) -> None:
+    model_file = tmp_path / "models.py"
+    model_file.write_text(MODEL_CODE, encoding="utf-8")
+
+    clean_json = tmp_path / "clean.json"
+    clean_json.write_text(json.dumps({"id": "p1", "amount": 100}), encoding="utf-8")
+
+    with patch("selfheal_api.cli._open_github_pr") as mock_open_pr:
+        rc_clean = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(clean_json),
+                "--open-pr",
+            ]
+        )
+
+    assert rc_clean == 0
+    mock_open_pr.assert_not_called()
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": "250"}), encoding="utf-8"
+    )
+    noop_patch = PatchResult(
+        model_name="PaymentEvent",
+        original_source=MODEL_CODE,
+        patched_source=MODEL_CODE,
+        plan=PatchPlan(model_name="PaymentEvent", actions=()),
+        applied=False,
+    )
+
+    with (
+        patch("selfheal_api.cli.synthesize_patch", return_value=noop_patch),
+        patch("selfheal_api.cli._open_github_pr") as mock_open_pr_nodiff,
+    ):
+        rc_nodiff = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--open-pr",
+            ]
+        )
+
+    assert rc_nodiff == 0
+    mock_open_pr_nodiff.assert_not_called()
+    assert model_file.read_text(encoding="utf-8") == MODEL_CODE
+
+
+def test_cli_heal_open_pr_failure_restores_existing_exports_and_modes(
+    tmp_path: Path,
+) -> None:
+    orig_model_bytes = MODEL_CODE.replace("\n", "\r\n").encode("utf-8")
+    model_file = tmp_path / "models.py"
+    model_file.write_bytes(orig_model_bytes)
+    os.chmod(model_file, 0o755)
+
+    orig_zod_bytes = b"// existing zod\r\nexport const keep = 1;\r\n"
+    zod_out = tmp_path / "payment.ts"
+    zod_out.write_bytes(orig_zod_bytes)
+    os.chmod(zod_out, 0o640)
+
+    orig_openapi_bytes = b'{"openapi": "3.1.0", "info": {"title": "existing"}}\r\n'
+    openapi_out = tmp_path / "openapi.json"
+    openapi_out.write_bytes(orig_openapi_bytes)
+    os.chmod(openapi_out, 0o750)
+
+    drifted_json = tmp_path / "drifted.json"
+    drifted_json.write_text(
+        json.dumps({"id": "p1", "amount_cents": 250}), encoding="utf-8"
+    )
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd[:2] == ["git", "status"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M models.py\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="gh auth failed")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        patch("selfheal_api.cli._run_mypy_shadow_gate", return_value=(True, "")),
+        patch("selfheal_api.cli._run_pytest_gate", return_value=(True, "1 passed")),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        rc = main(
+            [
+                "heal",
+                "--model",
+                f"{model_file}:PaymentEvent",
+                "--payload",
+                str(drifted_json),
+                "--zod",
+                str(zod_out),
+                "--openapi",
+                str(openapi_out),
+                "--open-pr",
+            ]
+        )
+
+    assert rc == 2
+    assert model_file.read_bytes() == orig_model_bytes
+    assert stat.S_IMODE(model_file.stat().st_mode) == 0o755
+    assert zod_out.read_bytes() == orig_zod_bytes
+    assert stat.S_IMODE(zod_out.stat().st_mode) == 0o640
+    assert openapi_out.read_bytes() == orig_openapi_bytes
+    assert stat.S_IMODE(openapi_out.stat().st_mode) == 0o750

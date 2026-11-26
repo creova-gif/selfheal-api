@@ -233,3 +233,138 @@ def test_handle_stripe_webhook_upgrade_pro_team_idempotency_and_delete() -> None
     assert canceled_sub.plan == PlanTier.FREE
     assert canceled_sub.status == "canceled"
     assert store.get_limits("acme") == PLAN_CATALOG[PlanTier.FREE]
+
+
+def test_late_subscription_updated_does_not_resurrect_canceled_subscription() -> None:
+    secret = "whsec_test"
+    store = BillingStore()
+    now = 1_700_000_000
+
+    checkout_body = json.dumps(
+        {
+            "id": "evt_co_1",
+            "type": "checkout.session.completed",
+            "created": 100,
+            "data": {
+                "object": {
+                    "customer": "cus_late",
+                    "subscription": "sub_late",
+                    "metadata": {"org_id": "org-late", "plan": "pro"},
+                }
+            },
+        }
+    ).encode("utf-8")
+    s1, _ = handle_stripe_webhook(
+        secret, checkout_body, _sign_stripe_payload(secret, checkout_body, now), store, now=now
+    )
+    assert s1 == 200
+
+    delete_body = json.dumps(
+        {
+            "id": "evt_del_1",
+            "type": "customer.subscription.deleted",
+            "created": 300,
+            "data": {
+                "object": {
+                    "id": "sub_late",
+                    "customer": "cus_late",
+                }
+            },
+        }
+    ).encode("utf-8")
+    s2, _ = handle_stripe_webhook(
+        secret, delete_body, _sign_stripe_payload(secret, delete_body, now), store, now=now
+    )
+    assert s2 == 200
+    assert store.get_subscription("org-late").status == "canceled"
+    assert store.get_subscription("org-late").plan == PlanTier.FREE
+
+    # Stale out-of-order subscription.updated (created=200 < 300) must be ignored
+    stale_update_body = json.dumps(
+        {
+            "id": "evt_upd_stale",
+            "type": "customer.subscription.updated",
+            "created": 200,
+            "data": {
+                "object": {
+                    "id": "sub_late",
+                    "customer": "cus_late",
+                    "status": "active",
+                    "items": {"data": [{"price": {"lookup_key": "team"}}]},
+                }
+            },
+        }
+    ).encode("utf-8")
+    s3, resp3 = handle_stripe_webhook(
+        secret,
+        stale_update_body,
+        _sign_stripe_payload(secret, stale_update_body, now),
+        store,
+        now=now,
+    )
+    assert s3 == 200
+    assert resp3["ignored"] is True
+    assert resp3["stale"] is True
+
+    final_sub = store.get_subscription("org-late")
+    assert final_sub.status == "canceled"
+    assert final_sub.plan == PlanTier.FREE
+    assert store.get_limits("org-late") == PLAN_CATALOG[PlanTier.FREE]
+
+
+def test_stripe_retry_applies_update_after_org_id_is_linked() -> None:
+    secret = "whsec_test"
+    store = BillingStore()
+    now = 1_700_000_000
+
+    # 1. subscription.updated arrives before checkout links cus_retry/sub_retry -> retryable 400
+    early_update_body = json.dumps(
+        {
+            "id": "evt_early_upd",
+            "type": "customer.subscription.updated",
+            "created": 200,
+            "data": {
+                "object": {
+                    "id": "sub_retry",
+                    "customer": "cus_retry",
+                    "status": "active",
+                    "items": {"data": [{"price": {"lookup_key": "team"}}]},
+                }
+            },
+        }
+    ).encode("utf-8")
+    early_sig = _sign_stripe_payload(secret, early_update_body, now)
+    s1, resp1 = handle_stripe_webhook(secret, early_update_body, early_sig, store, now=now)
+    assert s1 == 400
+    assert resp1["error"] == "missing_org_id"
+    assert store.is_event_processed("evt_early_upd") is False
+
+    # 2. checkout.session.completed links customer/subscription to org-retry
+    checkout_body = json.dumps(
+        {
+            "id": "evt_checkout_link",
+            "type": "checkout.session.completed",
+            "created": 100,
+            "data": {
+                "object": {
+                    "customer": "cus_retry",
+                    "subscription": "sub_retry",
+                    "metadata": {"org_id": "org-retry", "plan": "pro"},
+                }
+            },
+        }
+    ).encode("utf-8")
+    s2, _ = handle_stripe_webhook(
+        secret, checkout_body, _sign_stripe_payload(secret, checkout_body, now), store, now=now
+    )
+    assert s2 == 200
+    assert store.get_subscription("org-retry").plan == PlanTier.PRO
+
+    # 3. Stripe retries the exact same evt_early_upd -> now resolves org_id and applies TEAM
+    s3, resp3 = handle_stripe_webhook(secret, early_update_body, early_sig, store, now=now)
+    assert s3 == 200
+    assert resp3.get("duplicate") is not True
+    assert resp3["org_id"] == "org-retry"
+    assert resp3["plan"] == "team"
+    assert store.get_subscription("org-retry").plan == PlanTier.TEAM
+    assert store.is_event_processed("evt_early_upd") is True

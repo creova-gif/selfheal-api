@@ -111,6 +111,7 @@ class BillingStore:
         self._lock = threading.Lock()
         self._subscriptions: dict[str, SubscriptionState] = {}
         self._processed_events: OrderedDict[str, None] = OrderedDict()
+        self._latest_event_created: dict[str, int] = {}
         self._max_events = max_events
 
     def get_subscription(self, org_id: str) -> SubscriptionState:
@@ -163,6 +164,47 @@ class BillingStore:
     def is_event_processed(self, event_id: str) -> bool:
         with self._lock:
             return event_id in self._processed_events
+
+    def is_stale_event(
+        self,
+        *,
+        org_id: str,
+        subscription_id: str | None = None,
+        created: int | None = None,
+    ) -> bool:
+        """Return True if a newer Stripe event timestamp has already been applied."""
+        if created is None:
+            return False
+        with self._lock:
+            org_ts = self._latest_event_created.get(f"org:{org_id}")
+            if org_ts is not None and created < org_ts:
+                return True
+            if subscription_id:
+                sub_ts = self._latest_event_created.get(f"sub:{subscription_id}")
+                if sub_ts is not None and created < sub_ts:
+                    return True
+            return False
+
+    def record_event_created(
+        self,
+        *,
+        org_id: str,
+        subscription_id: str | None = None,
+        created: int | None = None,
+    ) -> None:
+        """Record the latest processed Stripe event `created` timestamp."""
+        if created is None:
+            return
+        with self._lock:
+            org_key = f"org:{org_id}"
+            self._latest_event_created[org_key] = max(
+                self._latest_event_created.get(org_key, created), created
+            )
+            if subscription_id:
+                sub_key = f"sub:{subscription_id}"
+                self._latest_event_created[sub_key] = max(
+                    self._latest_event_created.get(sub_key, created), created
+                )
 
 
 def _parse_plan_tier(raw: Any) -> PlanTier | None:
@@ -250,8 +292,15 @@ def handle_stripe_webhook(
     ):
         return 400, {"error": "missing_event_fields"}
 
-    if not store.mark_event_processed(event_id):
+    if store.is_event_processed(event_id):
         return 200, {"received": True, "duplicate": True, "event_id": event_id}
+
+    raw_created = parsed.get("created")
+    event_created = (
+        raw_created
+        if isinstance(raw_created, int) and not isinstance(raw_created, bool)
+        else None
+    )
 
     data = parsed.get("data")
     data_obj: dict[str, Any] = (
@@ -262,7 +311,7 @@ def handle_stripe_webhook(
     if event_type == "checkout.session.completed":
         org_id = _extract_org_id(data_obj, store)
         if org_id is None:
-            return 400, {"error": "missing_org_id", "event_id": event_id}
+            return 400, {"error": "missing_org_id", "event_id": event_id, "retryable": True}
 
         metadata = data_obj.get("metadata")
         raw_plan = metadata.get("plan") if isinstance(metadata, dict) else None
@@ -279,6 +328,20 @@ def handle_stripe_webhook(
             else None
         )
 
+        if not store.mark_event_processed(event_id):
+            return 200, {"received": True, "duplicate": True, "event_id": event_id}
+        if store.is_stale_event(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
+        ):
+            return 200, {
+                "received": True,
+                "ignored": True,
+                "stale": True,
+                "event_id": event_id,
+                "event_type": event_type,
+                "org_id": org_id,
+            }
+
         updated = store.upsert_subscription(
             SubscriptionState(
                 org_id=org_id,
@@ -287,6 +350,9 @@ def handle_stripe_webhook(
                 stripe_customer_id=customer_id,
                 stripe_subscription_id=subscription_id,
             )
+        )
+        store.record_event_created(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
         )
         return 200, {
             "received": True,
@@ -300,9 +366,29 @@ def handle_stripe_webhook(
     if event_type == "customer.subscription.updated":
         org_id = _extract_org_id(data_obj, store)
         if org_id is None:
-            return 400, {"error": "missing_org_id", "event_id": event_id}
+            return 400, {"error": "missing_org_id", "event_id": event_id, "retryable": True}
 
         current = store.get_subscription(org_id)
+        subscription_id = (
+            data_obj.get("id")
+            if isinstance(data_obj.get("id"), str)
+            else current.stripe_subscription_id
+        )
+
+        if not store.mark_event_processed(event_id):
+            return 200, {"received": True, "duplicate": True, "event_id": event_id}
+        if store.is_stale_event(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
+        ):
+            return 200, {
+                "received": True,
+                "ignored": True,
+                "stale": True,
+                "event_id": event_id,
+                "event_type": event_type,
+                "org_id": org_id,
+            }
+
         parsed_plan = _extract_plan_from_subscription(data_obj)
         new_plan = parsed_plan if parsed_plan is not None else current.plan
 
@@ -314,11 +400,6 @@ def handle_stripe_webhook(
             if isinstance(data_obj.get("customer"), str)
             else current.stripe_customer_id
         )
-        subscription_id = (
-            data_obj.get("id")
-            if isinstance(data_obj.get("id"), str)
-            else current.stripe_subscription_id
-        )
 
         updated = store.upsert_subscription(
             SubscriptionState(
@@ -328,6 +409,9 @@ def handle_stripe_webhook(
                 stripe_customer_id=customer_id,
                 stripe_subscription_id=subscription_id,
             )
+        )
+        store.record_event_created(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
         )
         return 200, {
             "received": True,
@@ -341,18 +425,33 @@ def handle_stripe_webhook(
     if event_type == "customer.subscription.deleted":
         org_id = _extract_org_id(data_obj, store)
         if org_id is None:
-            return 400, {"error": "missing_org_id", "event_id": event_id}
+            return 400, {"error": "missing_org_id", "event_id": event_id, "retryable": True}
 
         current = store.get_subscription(org_id)
-        customer_id = (
-            data_obj.get("customer")
-            if isinstance(data_obj.get("customer"), str)
-            else current.stripe_customer_id
-        )
         subscription_id = (
             data_obj.get("id")
             if isinstance(data_obj.get("id"), str)
             else current.stripe_subscription_id
+        )
+
+        if not store.mark_event_processed(event_id):
+            return 200, {"received": True, "duplicate": True, "event_id": event_id}
+        if store.is_stale_event(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
+        ):
+            return 200, {
+                "received": True,
+                "ignored": True,
+                "stale": True,
+                "event_id": event_id,
+                "event_type": event_type,
+                "org_id": org_id,
+            }
+
+        customer_id = (
+            data_obj.get("customer")
+            if isinstance(data_obj.get("customer"), str)
+            else current.stripe_customer_id
         )
 
         updated = store.upsert_subscription(
@@ -364,6 +463,9 @@ def handle_stripe_webhook(
                 stripe_subscription_id=subscription_id,
             )
         )
+        store.record_event_created(
+            org_id=org_id, subscription_id=subscription_id, created=event_created
+        )
         return 200, {
             "received": True,
             "event_id": event_id,
@@ -373,6 +475,8 @@ def handle_stripe_webhook(
             "status": updated.status,
         }
 
+    if not store.mark_event_processed(event_id):
+        return 200, {"received": True, "duplicate": True, "event_id": event_id}
     return 200, {
         "received": True,
         "ignored": True,

@@ -9,10 +9,12 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,19 +65,53 @@ def _load_json_file(path_str: str) -> dict[str, Any]:
     return data
 
 
-def _atomic_write(target: Path, content: str) -> None:
+@dataclass(frozen=True)
+class _FileSnapshot:
+    """Captured raw bytes and permission bits for lossless rollback."""
+
+    path: Path
+    existed: bool
+    raw_bytes: bytes | None
+    mode: int | None
+
+    @classmethod
+    def capture(cls, path: Path) -> _FileSnapshot:
+        if not path.exists():
+            return cls(path=path, existed=False, raw_bytes=None, mode=None)
+        return cls(
+            path=path,
+            existed=True,
+            raw_bytes=path.read_bytes(),
+            mode=stat.S_IMODE(path.stat().st_mode),
+        )
+
+    def restore(self) -> None:
+        if not self.existed:
+            self.path.unlink(missing_ok=True)
+            return
+        if self.raw_bytes is not None:
+            _atomic_write_bytes(self.path, self.raw_bytes, mode=self.mode)
+
+
+def _atomic_write_bytes(target: Path, data: bytes, mode: int | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        if mode is not None:
+            os.chmod(tmp_name, mode)
         os.replace(tmp_name, target)
     except Exception:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+
+
+def _atomic_write(target: Path, content: str, mode: int | None = None) -> None:
+    _atomic_write_bytes(target, content.encode("utf-8"), mode=mode)
 
 
 def _run_mypy_shadow_gate(model_path: Path, patched_source: str) -> tuple[bool, str]:
@@ -415,8 +451,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
-    source_code = model_path.read_text(encoding="utf-8")
+    if not report.has_drift:
+        return 0
+
+    model_snapshot = _FileSnapshot.capture(model_path)
+    source_code = (model_snapshot.raw_bytes or b"").decode("utf-8")
     patch_result = synthesize_patch(source_code, report, root_model=model_cls)
+    if patch_result.patched_source == source_code:
+        return 0
 
     verification = verify_patch(patch_result, drifted_payload, canonical_payload)
     if not verification.passed:
@@ -430,7 +472,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     pytest_args = shlex.split(args.pytest_args) if args.pytest_args else []
     keep_written = False
-    _atomic_write(model_path, patch_result.patched_source)
+    _atomic_write(model_path, patch_result.patched_source, mode=model_snapshot.mode)
     try:
         pytest_ok, pytest_detail = _run_pytest_gate(pytest_args)
         if not pytest_ok:
@@ -439,7 +481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         keep_written = bool(args.write or args.open_pr)
     finally:
         if not keep_written:
-            _atomic_write(model_path, source_code)
+            model_snapshot.restore()
 
     if args.diff:
         diff_lines = difflib.unified_diff(
@@ -451,21 +493,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write("".join(diff_lines))
 
     zod_path: Path | None = None
-    zod_existed = False
+    zod_snapshot: _FileSnapshot | None = None
     if args.zod is not None:
         zod_path = Path(args.zod)
-        zod_existed = zod_path.exists()
+        zod_snapshot = _FileSnapshot.capture(zod_path)
         zod_code = synthesize_zod_preprocessor(patch_result.plan)
-        _atomic_write(zod_path, zod_code)
+        _atomic_write(zod_path, zod_code, mode=zod_snapshot.mode)
 
     openapi_path: Path | None = None
-    openapi_existed = False
+    openapi_snapshot: _FileSnapshot | None = None
     if args.openapi is not None:
         openapi_path = Path(args.openapi)
-        openapi_existed = openapi_path.exists()
+        openapi_snapshot = _FileSnapshot.capture(openapi_path)
         spec = emit_openapi_schema_patch(model_cls, patch_result.plan)
         doc = emit_openapi_document([spec])
-        _atomic_write(openapi_path, json.dumps(doc, indent=2) + "\n")
+        _atomic_write(
+            openapi_path, json.dumps(doc, indent=2) + "\n", mode=openapi_snapshot.mode
+        )
 
     if args.open_pr:
         fp = compute_drift_fingerprint(report)
@@ -522,11 +566,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             f"warning: failed to restore branch {orig_branch}: {chk_exc}",
                             file=sys.stderr,
                         )
-                _atomic_write(model_path, source_code)
-                if zod_path is not None and not zod_existed:
-                    zod_path.unlink(missing_ok=True)
-                if openapi_path is not None and not openapi_existed:
-                    openapi_path.unlink(missing_ok=True)
+                model_snapshot.restore()
+                if zod_snapshot is not None:
+                    zod_snapshot.restore()
+                if openapi_snapshot is not None:
+                    openapi_snapshot.restore()
             print(f"pr creation failed: {exc}", file=sys.stderr)
             return 2
 

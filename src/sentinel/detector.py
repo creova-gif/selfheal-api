@@ -206,6 +206,10 @@ def _resolve_expected_type(
     return "unknown"
 
 
+def _normalize_list_indices(path: tuple[str | int, ...]) -> tuple[str | int, ...]:
+    return tuple(0 if isinstance(seg, int) else seg for seg in path)
+
+
 def _classify_list_kinds(items: list[Any], max_items: int = 256) -> str:
     if not items:
         return str(PrimitiveKind.EMPTY_LIST)
@@ -473,7 +477,14 @@ def detect_drift(
 
     redacted = redact_payload(parsed)
     flat_kinds = _flatten_redacted(redacted)
-    extra_candidates = _collect_extra_paths(expected_model, parsed)
+    raw_extra_candidates = _collect_extra_paths(expected_model, parsed)
+    extra_candidates: list[tuple[tuple[str | int, ...], str]] = []
+    seen_extra: set[tuple[tuple[str | int, ...], str]] = set()
+    for cand_path, cand_kind in raw_extra_candidates:
+        norm_path = _normalize_list_indices(cand_path)
+        if (norm_path, cand_kind) not in seen_extra:
+            seen_extra.add((norm_path, cand_kind))
+            extra_candidates.append((norm_path, cand_kind))
 
     raw_issues: list[DriftIssue] = []
     seen_paths: set[tuple[DriftKind, tuple[str | int, ...]]] = set()
@@ -487,9 +498,7 @@ def detect_drift(
             )
             while len(loc_tuple) > 1 and isinstance(loc_tuple[-1], int):
                 loc_tuple = loc_tuple[:-1]
-            field_loc: tuple[str | int, ...] = tuple(
-                0 if isinstance(seg, int) else seg for seg in loc_tuple
-            )
+            field_loc: tuple[str | int, ...] = _normalize_list_indices(loc_tuple)
             found, observed_val = _lookup_path(parsed, loc_tuple)
             kind = _classify_validation_error(err, observed_val if found else None)
             expected_type = _resolve_expected_type(expected_model, field_loc)

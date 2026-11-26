@@ -147,7 +147,8 @@ def _emit_ts_action_lines(action: PatchAction, action_idx: int = 0) -> list[str]
         elif "list[bool]" in exp:
             lines.append(f"  if (Array.isArray(normalized[{f!r}])) {{")
             lines.append(
-                f"    normalized[{f!r}] = (normalized[{f!r}] as unknown[]).map((v) => Boolean(v));"
+                f"    normalized[{f!r}] = (normalized[{f!r}] as unknown[])"
+                f".map((v) => _parseBool(v));"
             )
             lines.append("  }")
     elif "int" in exp and "dict" not in exp:
@@ -171,18 +172,8 @@ def _emit_ts_action_lines(action: PatchAction, action_idx: int = 0) -> list[str]
         lines.append("    }")
         lines.append("  }")
     elif "bool" in exp:
-        lines.append(f"  if (typeof normalized[{f!r}] === 'string') {{")
-        lines.append(
-            f"    const _s = (normalized[{f!r}] as string).trim().toLowerCase();"
-        )
-        lines.append(
-            f"    if (_s === 'true' || _s === '1' || _s === 'yes') normalized[{f!r}] = true;"
-        )
-        lines.append(
-            f"    else if (_s === 'false' || _s === '0' || _s === 'no') normalized[{f!r}] = false;"
-        )
-        lines.append(f"  }} else if (typeof normalized[{f!r}] === 'number') {{")
-        lines.append(f"    normalized[{f!r}] = Boolean(normalized[{f!r}]);")
+        lines.append(f"  if ({f!r} in normalized) {{")
+        lines.append(f"    normalized[{f!r}] = _parseBool(normalized[{f!r}]);")
         lines.append("  }")
     elif exp == "str" or exp == "str | none":
         lines.append(
@@ -228,10 +219,28 @@ def synthesize_zod_preprocessor(plan: PatchPlan) -> str:
         [m for m in grouped if m != plan.model_name],
         key=lambda m: -len(model_paths.get(m, ())),
     )
-    ordered_models.append(plan.model_name)
+    if plan.model_name not in ordered_models:
+        ordered_models.append(plan.model_name)
 
     known_paths = set(model_paths.values())
     sections: list[str] = ["import { z } from 'zod';", ""]
+    if any("bool" in act.expected_type.lower() for act in plan.actions):
+        sections.extend(
+            [
+                "function _parseBool(v: unknown): unknown {",
+                "  if (typeof v === 'boolean') return v;",
+                "  if (typeof v === 'string') {",
+                "    const s = v.trim().toLowerCase();",
+                "    if (s === 'true' || s === '1' || s === 'yes') return true;",
+                "    if (s === 'false' || s === '0' || s === 'no') return false;",
+                "    return v;",
+                "  }",
+                "  if (typeof v === 'number') return v !== 0;",
+                "  return v;",
+                "}",
+                "",
+            ]
+        )
     for model_name in ordered_models:
         actions = grouped.get(model_name, [])
         fn_name = f"normalize{model_name}Drift"

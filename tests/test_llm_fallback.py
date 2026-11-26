@@ -179,3 +179,90 @@ def test_anthropic_provider_enforces_call_cap_and_strips_fences() -> None:
     assert second == {"customer_email": ("x_party_ref",)}
     assert third == {}
     assert mock_open.call_count == 2
+
+
+def test_identifier_object_keys_filtered_before_llm_fallback() -> None:
+    captured_extras: list[dict[str, str]] = []
+
+    def resolver(
+        model_name: str,
+        missing_fields: dict[str, str],
+        extra_observed_kinds: dict[str, str],
+    ) -> dict[str, tuple[str | int, ...]]:
+        captured_extras.append(extra_observed_kinds)
+        return {}
+
+    provider = DeterministicMappingProvider(resolver)
+    mutated: dict[str, Any] = {
+        "123456789": {"x_opaque_val": "a@example.com"},
+        "550e8400-e29b-41d4-a716-446655440000": {"x_opaque_val": "b@example.com"},
+        "alice@example.com": {"x_opaque_val": "c@example.com"},
+        "x_safe_ref": "ok@example.com",
+        "amount": 100,
+    }
+    detect_drift(CustomerWebhook, mutated, mapping_provider=provider)
+    assert len(captured_extras) == 1
+    assert captured_extras[0] == {"x_safe_ref": "<str>"}
+
+
+def test_anthropic_provider_filters_identifier_keys_from_prompt() -> None:
+    import io
+
+    sent_bodies: list[str] = []
+
+    class _FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._buf = io.BytesIO(body)
+
+        def read(self) -> bytes:
+            return self._buf.read()
+
+        def __enter__(self) -> _FakeResp:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 5.0) -> _FakeResp:
+        assert isinstance(req.data, bytes)
+        sent_bodies.append(req.data.decode("utf-8"))
+        return _FakeResp(
+            json.dumps(
+                {"content": [{"text": '{"customer_email": "x_safe_ref"}'}]}
+            ).encode("utf-8")
+        )
+
+    provider = AnthropicSchemaMappingProvider(api_key="test-key")
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = provider.resolve_opaque_mappings(
+            "CustomerWebhook",
+            {"customer_email": "str"},
+            {
+                "123456789": "<str>",
+                "users.987654321.mail": "<str>",
+                "550e8400-e29b-41d4-a716-446655440000": "<str>",
+                "alice@example.com": "<str>",
+                "x_safe_ref": "<str>",
+            },
+        )
+    assert result == {"customer_email": ("x_safe_ref",)}
+    assert len(sent_bodies) == 1
+    prompt_body = sent_bodies[0]
+    assert "123456789" not in prompt_body
+    assert "987654321" not in prompt_body
+    assert "550e8400-e29b-41d4-a716-446655440000" not in prompt_body
+    assert "alice@example.com" not in prompt_body
+    assert "x_safe_ref" in prompt_body
+
+    # When only identifier keys exist, no HTTP request is made at all
+    with patch("urllib.request.urlopen", side_effect=AssertionError("must not call")):
+        empty_res = provider.resolve_opaque_mappings(
+            "CustomerWebhook",
+            {"customer_email": "str"},
+            {
+                "123456789": "<str>",
+                "550e8400-e29b-41d4-a716-446655440000": "<str>",
+                "alice@example.com": "<str>",
+            },
+        )
+    assert empty_res == {}

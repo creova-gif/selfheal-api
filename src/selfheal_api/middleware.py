@@ -162,7 +162,7 @@ class SelfHealASGIMiddleware:
             report = detect_drift(binding.model_cls, body, mapping_provider=None)
             if report.has_drift:
                 pre_fp = compute_drift_fingerprint(report)
-                is_new, plan = await asyncio.to_thread(self._deduplicator.begin, pre_fp)
+                is_new, plan = await self._deduplicator.begin_async(pre_fp)
                 if is_new:
                     try:
                         enriched = (

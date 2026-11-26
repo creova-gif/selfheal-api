@@ -440,3 +440,146 @@ def test_apply_patch_plan_in_memory_zero_exec_and_coercions(
     assert normalized["counts"] == [1, 2]
     assert normalized["ratios"] == [1.5, 2.0]
     assert normalized["toggles"] == [True, False, True]
+
+
+def test_list_int_preserves_64bit_integer_precision() -> None:
+    class _IdsEvent(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        ids: list[int]
+        single_id: int
+
+    src = """from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict
+
+
+class _IdsEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[int]
+    single_id: int
+"""
+    large_id_1 = 9007199254740993  # 2^53 + 1, loses precision if cast to float
+    large_id_2 = 9007199254740995  # 2^53 + 3
+    drifted = {
+        "ids": [large_id_1, str(large_id_2)],
+        "single_id": str(large_id_1),
+    }
+    report = detect_drift(_IdsEvent, drifted)
+    patch_res = synthesize_patch(src, report, root_model=_IdsEvent)
+    assert patch_res.applied
+
+    ns: dict[str, Any] = {}
+    exec(patch_res.patched_source, ns)
+    rebuilt = ns["_IdsEvent"]
+    rebuilt.model_rebuild(_types_namespace=ns, force=True)
+    parsed = rebuilt.model_validate(drifted, strict=True)
+    assert parsed.ids == [large_id_1, large_id_2]
+    assert parsed.single_id == large_id_1
+
+    in_mem = apply_patch_plan_in_memory(drifted, patch_res.plan, root_model=_IdsEvent)
+    assert in_mem["ids"] == [large_id_1, large_id_2]
+    assert in_mem["single_id"] == large_id_1
+
+
+def test_child_patch_preserves_existing_config_dict_settings() -> None:
+    class _Child(BaseModel):
+        model_config = ConfigDict(
+            frozen=True,
+            str_strip_whitespace=True,
+            extra="forbid",
+        )
+        postal_code: str
+
+    class _Parent(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+        child: _Child
+
+    src = """from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict
+
+
+class _Child(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+    postal_code: str
+
+
+class _Parent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    child: _Child
+"""
+    drifted = {"child": {"zip_code": "  94107  "}}
+    report = detect_drift(_Parent, drifted)
+    patch_res = synthesize_patch(src, report, root_model=_Parent)
+    assert patch_res.applied
+    assert "frozen=True" in patch_res.patched_source
+    assert "str_strip_whitespace=True" in patch_res.patched_source
+
+    ns: dict[str, Any] = {}
+    exec(patch_res.patched_source, ns)
+    rebuilt_parent = ns["_Parent"]
+    rebuilt_parent.model_rebuild(_types_namespace=ns, force=True)
+    parsed = rebuilt_parent.model_validate(drifted, strict=True)
+    assert parsed.child.postal_code == "94107"
+
+
+def test_in_memory_normalization_preserves_valid_union_and_strips_unique_match() -> None:
+    class _Pickup(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        pickup_time: str
+
+    class _Delivery(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        address: str
+
+    class _Shipment(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        fulfillment: _Pickup | _Delivery
+
+    plan = PatchPlan(model_name="_Shipment", actions=())
+
+    valid_delivery = {"fulfillment": {"address": "123 Main St"}}
+    norm_valid = apply_patch_plan_in_memory(
+        valid_delivery, plan, root_model=_Shipment
+    )
+    assert norm_valid["fulfillment"] == {"address": "123 Main St"}
+
+    invalid_delivery_with_extra = {
+        "fulfillment": {"address": "123 Main St", "legacy_note": "drop at door"}
+    }
+    norm_stripped = apply_patch_plan_in_memory(
+        invalid_delivery_with_extra, plan, root_model=_Shipment
+    )
+    assert norm_stripped["fulfillment"] == {"address": "123 Main St"}
+
+
+def test_zod_emitter_explicit_bool_parser_and_root_normalizer_on_child_only_drift() -> None:
+    child_only_plan = PatchPlan(
+        model_name="OrderEvent",
+        actions=(
+            PatchAction(
+                target_model="BillingAddress",
+                target_field="is_default",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="bool",
+                observed_kind="<bool_str>",
+                nested_path=("billing",),
+            ),
+            PatchAction(
+                target_model="BillingAddress",
+                target_field="flags",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="list[bool]",
+                observed_kind="list[<bool_str>]",
+                nested_path=("billing",),
+            ),
+        ),
+    )
+    zod_ts = synthesize_zod_preprocessor(child_only_plan)
+    assert "Boolean(" not in zod_ts
+    assert "function _parseBool(" in zod_ts
+    assert "s === 'false' || s === '0' || s === 'no'" in zod_ts
+    assert "_parseBool(normalized['is_default'])" in zod_ts
+    assert ".map((v) => _parseBool(v))" in zod_ts
+    assert zod_ts.count("export function normalizeOrderEventDrift") == 1
+    assert "z.preprocess(normalizeOrderEventDrift, schema)" in zod_ts

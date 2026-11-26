@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import io
 import json
+import threading
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, ConfigDict
 
 from selfheal_api.middleware import (
@@ -296,3 +300,210 @@ def test_wsgi_passthrough_and_drift_normalization_deduplication() -> None:
     assert llm_calls == 1
     assert len(drift_events) == 1
     assert len(statuses) == 6
+
+
+def test_asgi_async_burst_small_threadpool_no_deadlock() -> None:
+    llm_calls = 0
+    received_bodies: list[bytes] = []
+
+    def resolver(
+        _model_name: str,
+        _missing_fields: dict[str, str],
+        _extra_observed_kinds: dict[str, str],
+    ) -> dict[str, tuple[str | int, ...]]:
+        nonlocal llm_calls
+        llm_calls += 1
+        time.sleep(0.03)
+        return {"id": ("x_ref_alpha",)}
+
+    provider = DeterministicMappingProvider(resolver)
+    dedup = DriftDeduplicator(max_fingerprints=16)
+
+    async def downstream(
+        _scope: dict[str, Any],
+        receive: Callable[..., Awaitable[dict[str, Any]]],
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        msg = await receive()
+        body = msg["body"]
+        WebhookOrder.model_validate_json(body, strict=True)
+        received_bodies.append(body)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    middleware = SelfHealASGIMiddleware(
+        downstream,
+        {"/webhooks/order": WebhookOrder},
+        normalize=True,
+        mapping_provider=provider,
+        deduplicator=dedup,
+    )
+
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            loop.set_default_executor(pool)
+            tasks = []
+            for idx in range(10):
+                raw = json.dumps(
+                    {"x_ref_alpha": f"ord_{idx}", "amount": str(idx + 10)}
+                ).encode("utf-8")
+                scope = {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/webhooks/order",
+                    "headers": [(b"content-length", str(len(raw)).encode("ascii"))],
+                }
+                tasks.append(
+                    asyncio.create_task(_run_asgi_request(middleware, scope, [raw]))
+                )
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+
+    asyncio.run(_run())
+    assert llm_calls == 1
+    assert len(received_bodies) == 10
+
+
+def test_asgi_cancel_owner_releases_reservation() -> None:
+    provider_entered = threading.Event()
+    release_provider = threading.Event()
+    llm_calls = 0
+    received_bodies: list[bytes] = []
+
+    def resolver(
+        _model_name: str,
+        _missing_fields: dict[str, str],
+        _extra_observed_kinds: dict[str, str],
+    ) -> dict[str, tuple[str | int, ...]]:
+        nonlocal llm_calls
+        llm_calls += 1
+        if llm_calls == 1:
+            provider_entered.set()
+            release_provider.wait(timeout=2.0)
+        return {"id": ("x_ref_alpha",)}
+
+    provider = DeterministicMappingProvider(resolver)
+    dedup = DriftDeduplicator(max_fingerprints=16)
+
+    async def downstream(
+        _scope: dict[str, Any],
+        receive: Callable[..., Awaitable[dict[str, Any]]],
+        _send: Callable[..., Awaitable[None]],
+    ) -> None:
+        msg = await receive()
+        received_bodies.append(msg["body"])
+
+    middleware = SelfHealASGIMiddleware(
+        downstream,
+        {"/webhooks/order": WebhookOrder},
+        normalize=True,
+        mapping_provider=provider,
+        deduplicator=dedup,
+    )
+
+    async def _run() -> None:
+        raw1 = b'{"x_ref_alpha": "ord_1", "amount": "10"}'
+        scope1 = {"type": "http", "method": "POST", "path": "/webhooks/order"}
+        owner_task = asyncio.create_task(_run_asgi_request(middleware, scope1, [raw1]))
+        while not provider_entered.is_set():
+            await asyncio.sleep(0.005)
+
+        owner_task.cancel()
+        release_provider.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner_task
+
+        raw2 = b'{"x_ref_alpha": "ord_2", "amount": "20"}'
+        scope2 = {"type": "http", "method": "POST", "path": "/webhooks/order"}
+        await asyncio.wait_for(
+            _run_asgi_request(middleware, scope2, [raw2]),
+            timeout=2.0,
+        )
+
+    asyncio.run(_run())
+    assert llm_calls == 2
+    assert len(received_bodies) == 1
+    assert json.loads(received_bodies[0].decode("utf-8")) == {
+        "id": "ord_2",
+        "amount": 20,
+    }
+
+
+def test_asgi_cancel_duplicate_waiter_does_not_abort_owner() -> None:
+    provider_entered = threading.Event()
+    release_provider = threading.Event()
+    llm_calls = 0
+    received_bodies: list[bytes] = []
+
+    def resolver(
+        _model_name: str,
+        _missing_fields: dict[str, str],
+        _extra_observed_kinds: dict[str, str],
+    ) -> dict[str, tuple[str | int, ...]]:
+        nonlocal llm_calls
+        llm_calls += 1
+        provider_entered.set()
+        release_provider.wait(timeout=2.0)
+        return {"id": ("x_ref_alpha",)}
+
+    provider = DeterministicMappingProvider(resolver)
+    dedup = DriftDeduplicator(max_fingerprints=16)
+
+    async def downstream(
+        _scope: dict[str, Any],
+        receive: Callable[..., Awaitable[dict[str, Any]]],
+        _send: Callable[..., Awaitable[None]],
+    ) -> None:
+        msg = await receive()
+        received_bodies.append(msg["body"])
+
+    middleware = SelfHealASGIMiddleware(
+        downstream,
+        {"/webhooks/order": WebhookOrder},
+        normalize=True,
+        mapping_provider=provider,
+        deduplicator=dedup,
+    )
+
+    async def _run() -> None:
+        raw_owner = b'{"x_ref_alpha": "ord_owner", "amount": "11"}'
+        scope_owner = {"type": "http", "method": "POST", "path": "/webhooks/order"}
+        owner_task = asyncio.create_task(
+            _run_asgi_request(middleware, scope_owner, [raw_owner])
+        )
+        while not provider_entered.is_set():
+            await asyncio.sleep(0.005)
+
+        raw_waiter = b'{"x_ref_alpha": "ord_waiter", "amount": "12"}'
+        scope_waiter = {"type": "http", "method": "POST", "path": "/webhooks/order"}
+        waiter_task = asyncio.create_task(
+            _run_asgi_request(middleware, scope_waiter, [raw_waiter])
+        )
+        await asyncio.sleep(0.01)
+        assert not waiter_task.done()
+
+        waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_task
+
+        release_provider.set()
+        await asyncio.wait_for(owner_task, timeout=2.0)
+
+        raw_cached = b'{"x_ref_alpha": "ord_cached", "amount": "13"}'
+        scope_cached = {"type": "http", "method": "POST", "path": "/webhooks/order"}
+        await asyncio.wait_for(
+            _run_asgi_request(middleware, scope_cached, [raw_cached]),
+            timeout=2.0,
+        )
+
+    asyncio.run(_run())
+    assert llm_calls == 1
+    assert len(received_bodies) == 2
+    assert json.loads(received_bodies[0].decode("utf-8")) == {
+        "id": "ord_owner",
+        "amount": 11,
+    }
+    assert json.loads(received_bodies[1].decode("utf-8")) == {
+        "id": "ord_cached",
+        "amount": 13,
+    }

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from selfheal_api.billing import BillingStore, handle_stripe_webhook
 from selfheal_api.dashboard import DashboardSnapshot, render_dashboard_html
@@ -44,10 +44,26 @@ _ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
+def _parse_model_specs(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, list):
+        specs: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                raise ValueError("model_specs entries must be strings")
+            specs.extend(part.strip() for part in item.split(",") if part.strip())
+        return specs
+    raise ValueError("model_specs must be a list of strings or comma-separated string")
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     webhook_secret: str = ""
+    api_secret: str = ""
     stripe_webhook_secret: str = ""
     github_webhook_secret: str = ""
     max_requests_per_minute: int = Field(default=60, ge=1)
@@ -62,15 +78,23 @@ class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=0, le=65535)
     webhook_secret: str = ""
+    api_secret: str = ""
     stripe_webhook_secret: str = ""
     github_webhook_secret: str = ""
     max_requests_per_minute: int = Field(default=60, ge=1)
     max_llm_calls_per_tenant: int = Field(default=20, ge=0)
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
     allow_unregistered_tenants: bool = True
+    allow_admin_read_bypass: bool = False
     include_zod_adapter: bool = True
     max_body_bytes: int = Field(default=1_048_576, ge=1024)
     db_path: str = ":memory:"
+    model_specs: list[str] = Field(default_factory=list)
+
+    @field_validator("model_specs", mode="before")
+    @classmethod
+    def _validate_model_specs(cls, value: Any) -> list[str]:
+        return _parse_model_specs(value)
 
     def default_tenant_config(self) -> TenantConfig:
         opts: dict[str, Any] = {
@@ -123,19 +147,33 @@ class TokenBucketRateLimiter:
         if max_requests_per_minute < 1:
             raise ValueError("max_requests_per_minute must be >= 1")
         with self._lock:
+            old_capacity = self._capacity
             new_capacity = float(max_requests_per_minute)
-            if new_capacity != self._capacity:
+            if new_capacity != old_capacity:
                 self._capacity = new_capacity
                 self._refill_rate = max_requests_per_minute / 60.0
-                self._tokens = min(self._tokens, self._capacity)
+                if new_capacity > old_capacity:
+                    self._tokens = min(
+                        self._capacity,
+                        self._tokens + (new_capacity - old_capacity),
+                    )
+                else:
+                    self._tokens = min(self._tokens, self._capacity)
 
 
 class TenantState:
     """Isolated per-tenant runtime state (deduplicator, rate limiter, LLM cap)."""
 
-    def __init__(self, org_id: str, config: TenantConfig) -> None:
+    def __init__(
+        self,
+        org_id: str,
+        config: TenantConfig,
+        *,
+        pinned: bool = False,
+    ) -> None:
         self.org_id = org_id
         self.config = config
+        self.pinned = pinned
         self.deduplicator = DriftDeduplicator(max_fingerprints=config.max_fingerprints)
         self.rate_limiter = TokenBucketRateLimiter(
             max_requests_per_minute=config.max_requests_per_minute
@@ -146,43 +184,62 @@ class TenantState:
             else None
         )
 
+    def apply_limits(self, max_requests_per_minute: int, max_llm_calls: int) -> None:
+        """Apply updated plan limits immediately to this tenant's runtime state."""
+        self.rate_limiter.update_limit(max_requests_per_minute)
+        if self.mapping_provider is not None:
+            self.mapping_provider.set_max_calls(max_llm_calls)
+
 
 class TenantRegistry:
     """Thread-safe registry maintaining strict per-org_id isolation."""
 
     def __init__(self, config: ServerConfig, max_tenants: int = 4096) -> None:
+        if max_tenants < 1:
+            raise ValueError("max_tenants must be >= 1")
         self._config = config
         self._max_tenants = max_tenants
         self._lock = threading.Lock()
-        self._tenants: OrderedDict[str, TenantState] = OrderedDict(
-            (org_id, TenantState(org_id=org_id, config=tenant_cfg))
+        self._pinned: dict[str, TenantState] = {
+            org_id: TenantState(org_id=org_id, config=tenant_cfg, pinned=True)
             for org_id, tenant_cfg in config.tenants.items()
-        )
+        }
+        self._dynamic: OrderedDict[str, TenantState] = OrderedDict()
 
     def get_or_create(self, org_id: str) -> TenantState | None:
         with self._lock:
-            existing = self._tenants.get(org_id)
+            pinned = self._pinned.get(org_id)
+            if pinned is not None:
+                return pinned
+            existing = self._dynamic.get(org_id)
             if existing is not None:
-                self._tenants.move_to_end(org_id)
+                self._dynamic.move_to_end(org_id)
                 return existing
             if not self._config.allow_unregistered_tenants:
                 return None
+            dynamic_cap = self._max_tenants - len(self._pinned)
+            if dynamic_cap <= 0:
+                return None
+            while len(self._dynamic) >= dynamic_cap:
+                self._dynamic.popitem(last=False)
             state = TenantState(
                 org_id=org_id,
                 config=self._config.default_tenant_config(),
+                pinned=False,
             )
-            self._tenants[org_id] = state
-            while len(self._tenants) > self._max_tenants:
-                self._tenants.popitem(last=False)
+            self._dynamic[org_id] = state
             return state
 
     def get_tenant(self, org_id: str) -> TenantState | None:
         with self._lock:
-            return self._tenants.get(org_id)
+            pinned = self._pinned.get(org_id)
+            if pinned is not None:
+                return pinned
+            return self._dynamic.get(org_id)
 
     def list_org_ids(self) -> list[str]:
         with self._lock:
-            return sorted(self._tenants.keys())
+            return sorted(set(self._pinned.keys()) | set(self._dynamic.keys()))
 
 
 class SelfHealHTTPServer(ThreadingHTTPServer):
@@ -215,15 +272,7 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
     server: SelfHealHTTPServer
     timeout = 10.0
 
-    def _authorize_tenant_read(self, org_id: str) -> bool:
-        tenant = self.server.registry.get_tenant(org_id)
-        secret = (
-            tenant.config.webhook_secret
-            if tenant is not None
-            else self.server.config.webhook_secret
-        )
-        if not secret:
-            return True
+    def _verify_read_secret(self, secret: str, org_id: str) -> bool:
         auth_hdr = self.headers.get("Authorization", "").strip()
         if auth_hdr.startswith("Bearer ") and hmac.compare_digest(
             auth_hdr[7:].strip(), secret
@@ -235,6 +284,49 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             or ""
         )
         return verify_webhook_signature(secret, org_id.encode("utf-8"), sig_hdr)
+
+    def _authorize_tenant_read(self, org_id: str) -> bool:
+        is_multi_tenant = (
+            len(self.server.config.tenants) > 0
+            or not self.server.config.allow_unregistered_tenants
+        )
+        server_secret = (
+            self.server.config.api_secret or self.server.config.webhook_secret
+        )
+        tenant = self.server.registry.get_tenant(org_id)
+
+        if tenant is not None:
+            tenant_secret = (
+                tenant.config.api_secret or tenant.config.webhook_secret
+            )
+            if tenant.pinned or tenant.config.api_secret:
+                if tenant_secret:
+                    return self._verify_read_secret(tenant_secret, org_id)
+                if is_multi_tenant:
+                    if self.server.config.allow_admin_read_bypass and server_secret:
+                        return self._verify_read_secret(server_secret, org_id)
+                    return False
+                return not server_secret or self._verify_read_secret(
+                    server_secret, org_id
+                )
+
+            # Unpinned dynamic tenant without its own api_secret
+            if is_multi_tenant:
+                if self.server.config.allow_admin_read_bypass and server_secret:
+                    return self._verify_read_secret(server_secret, org_id)
+                return False
+            if not server_secret:
+                return True
+            return self._verify_read_secret(server_secret, org_id)
+
+        # Unknown / unconfigured tenant
+        if is_multi_tenant:
+            if self.server.config.allow_admin_read_bypass and server_secret:
+                return self._verify_read_secret(server_secret, org_id)
+            return False
+        if not server_secret:
+            return True
+        return self._verify_read_secret(server_secret, org_id)
 
     def log_message(self, format: str, *args: Any) -> None:
         _logger.info("%s - %s", self.address_string(), format % args)
@@ -436,6 +528,14 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
+    def _sync_tenant_limits(self, org_id: str, tenant: TenantState | None = None) -> None:
+        target = tenant or self.server.registry.get_tenant(org_id)
+        if target is None:
+            return
+        if org_id in self.server.billing_store.list_org_ids():
+            limits = self.server.billing_store.get_limits(org_id)
+            target.apply_limits(limits.max_requests_per_minute, limits.max_llm_calls)
+
     def _handle_stripe_webhook_route(self) -> None:
         raw_body = self._read_body()
         if raw_body is None:
@@ -447,6 +547,10 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             sig_header,
             self.server.billing_store,
         )
+        if code == HTTPStatus.OK.value:
+            org_id = payload.get("org_id")
+            if isinstance(org_id, str) and org_id:
+                self._sync_tenant_limits(org_id)
         self._send_json(HTTPStatus(code), payload)
 
     def _handle_github_webhook_route(self) -> None:
@@ -532,17 +636,19 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
 
         tenant = self.server.registry.get_or_create(org_id_raw)
         if tenant is None:
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": f"unknown organization: {org_id_raw}"},
-            )
+            if self.server.config.allow_unregistered_tenants:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "tenant capacity exceeded"},
+                )
+            else:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": f"unknown organization: {org_id_raw}"},
+                )
             return
 
-        if org_id_raw in self.server.billing_store.list_org_ids():
-            limits = self.server.billing_store.get_limits(org_id_raw)
-            tenant.rate_limiter.update_limit(limits.max_requests_per_minute)
-            if tenant.mapping_provider is not None:
-                tenant.mapping_provider.set_max_calls(limits.max_llm_calls)
+        self._sync_tenant_limits(org_id_raw, tenant=tenant)
 
         if not tenant.rate_limiter.allow():
             self._send_json(
@@ -684,6 +790,13 @@ def create_server(
     model_registry: Mapping[str, type[BaseModel]] | None = None,
 ) -> SelfHealHTTPServer:
     resolved_config = config or ServerConfig(host=host, port=port)
+    resolved_models: Mapping[str, type[BaseModel]]
+    if model_registry is not None:
+        resolved_models = model_registry
+    elif resolved_config.model_specs:
+        resolved_models = _load_model_registry(resolved_config.model_specs)
+    else:
+        resolved_models = {}
     registry = TenantRegistry(resolved_config)
     ledger = DriftLedger(db_path=resolved_config.db_path)
     return SelfHealHTTPServer(
@@ -691,7 +804,7 @@ def create_server(
         SelfHealRequestHandler,
         config=resolved_config,
         registry=registry,
-        model_registry=model_registry or {},
+        model_registry=resolved_models,
         drift_ledger=ledger,
     )
 
@@ -714,6 +827,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     rpm_env = int(os.environ.get("SELFHEAL_MAX_RPM", "60"))
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
     db_path_env = os.environ.get("SELFHEAL_DB_PATH", "").strip() or ":memory:"
+    models_env = _parse_model_specs(os.environ.get("SELFHEAL_MODELS", ""))
     opts: dict[str, Any] = {
         "host": host_env,
         "port": port_env,
@@ -723,6 +837,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
         "max_requests_per_minute": rpm_env,
         "max_llm_calls_per_tenant": llm_cap_env,
         "db_path": db_path_env,
+        "model_specs": models_env,
     }
     return ServerConfig(**opts)
 
@@ -785,11 +900,12 @@ def main_server(argv: list[str] | None = None) -> int:
 
     raw_models: list[str] = []
     if args.models:
-        for item in args.models:
-            raw_models.extend(part.strip() for part in item.split(",") if part.strip())
+        raw_models = _parse_model_specs(args.models)
     else:
         env_models = os.environ.get("SELFHEAL_MODELS", "")
-        raw_models = [part.strip() for part in env_models.split(",") if part.strip()]
+        raw_models = (
+            _parse_model_specs(env_models) if env_models.strip() else config.model_specs
+        )
     model_registry = _load_model_registry(raw_models)
 
     server = create_server(
