@@ -19,6 +19,11 @@ import pytest
 from pydantic import BaseModel
 
 from selfheal_api.billing import PlanTier, SubscriptionState
+from selfheal_api.notifier import (
+    CompositeAlertNotifier,
+    SignedWebhookNotifier,
+    UrllibSlackNotifier,
+)
 from selfheal_api.server import (
     SelfHealHTTPServer,
     ServerConfig,
@@ -1297,3 +1302,24 @@ def test_events_export_validation_and_tenant_auth() -> None:
         with urllib.request.urlopen(ok_req, timeout=5.0) as resp:
             assert resp.status == 200
             assert "text/csv" in resp.headers.get("Content-Type", "")
+
+
+def test_server_wires_multi_channel_notifier_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SELFHEAL_SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T/B/X")
+    monkeypatch.setenv("SELFHEAL_ALERT_WEBHOOK_URL", "https://alerts.example.com/hook")
+    monkeypatch.setenv("SELFHEAL_ALERT_WEBHOOK_SECRET", "alert-secret")
+
+    cfg = _load_config_from_env_and_file(None)
+    server = create_server(host="127.0.0.1", port=0, config=cfg)
+    try:
+        assert isinstance(server.notifier, CompositeAlertNotifier)
+        assert len(server.notifier._notifiers) == 2
+        assert isinstance(server.notifier._notifiers[0], UrllibSlackNotifier)
+        assert isinstance(server.notifier._notifiers[1], SignedWebhookNotifier)
+    finally:
+        server.drift_ledger.close()
+        server.billing_store.close()
+        server.installation_registry.close()
+        server.server_close()

@@ -1,8 +1,26 @@
+from selfheal_api.billing import BillingStore
+from selfheal_api.github_app import InstallationRegistry
+from selfheal_api.ledger import DriftEventRecord, DriftLedger, OrgDriftSummary
 from selfheal_api.middleware import (
     RouteBinding,
     SelfHealASGIMiddleware,
     SelfHealWSGIMiddleware,
 )
+from selfheal_api.notifier import (
+    AlertNotifier,
+    CompositeAlertNotifier,
+    DriftAlert,
+    SignedWebhookNotifier,
+    UrllibSlackNotifier,
+)
+from selfheal_api.remediation import (
+    RemediationOutcome,
+    RemediationPipeline,
+    RemediationRequest,
+)
+from selfheal_api.replay import ReplayReport, run_replay_corpus
+from selfheal_api.server import ServerConfig, create_server
+from selfheal_api.worker import RemediationQueue
 from sentinel import (
     AnthropicSchemaMappingProvider,
     DeterministicMappingProvider,
@@ -39,30 +57,48 @@ def healthcheck() -> str:
 
 
 __all__ = [
+    "AlertNotifier",
     "AnthropicSchemaMappingProvider",
+    "BillingStore",
+    "CompositeAlertNotifier",
     "DeterministicMappingProvider",
+    "DriftAlert",
     "DriftDeduplicator",
+    "DriftEventRecord",
     "DriftIssue",
     "DriftKind",
+    "DriftLedger",
     "DriftReport",
+    "InstallationRegistry",
+    "OrgDriftSummary",
     "PatchAction",
     "PatchPlan",
     "PatchResult",
     "PrimitiveKind",
+    "RemediationOutcome",
+    "RemediationPipeline",
+    "RemediationQueue",
+    "RemediationRequest",
+    "ReplayReport",
     "RouteBinding",
     "SchemaMappingProvider",
     "SelfHealASGIMiddleware",
     "SelfHealWSGIMiddleware",
+    "ServerConfig",
+    "SignedWebhookNotifier",
+    "UrllibSlackNotifier",
     "VerificationResult",
     "__version__",
     "apply_patch_plan_in_memory",
     "build_patch_plan",
     "compute_drift_fingerprint",
+    "create_server",
     "detect_drift",
     "emit_openapi_document",
     "emit_openapi_schema_patch",
     "healthcheck",
     "redact_payload",
+    "run_replay_corpus",
     "selfheal_guard",
     "synthesize_patch",
     "synthesize_zod_preprocessor",

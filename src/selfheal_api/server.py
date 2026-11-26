@@ -33,7 +33,13 @@ from selfheal_api.github_app import (
     verify_webhook_signature as verify_webhook_signature,
 )
 from selfheal_api.ledger import DriftLedger
-from selfheal_api.notifier import AlertNotifier, DriftAlert
+from selfheal_api.notifier import (
+    AlertNotifier,
+    CompositeAlertNotifier,
+    DriftAlert,
+    SignedWebhookNotifier,
+    UrllibSlackNotifier,
+)
 from sentinel.detector import detect_drift
 from sentinel.guard import DriftDeduplicator, compute_drift_fingerprint
 from sentinel.llm_fallback import AnthropicSchemaMappingProvider
@@ -100,6 +106,9 @@ class ServerConfig(BaseModel):
     max_body_bytes: int = Field(default=1_048_576, ge=1024)
     db_path: str = ":memory:"
     model_specs: list[str] = Field(default_factory=list)
+    slack_webhook_url: str = ""
+    alert_webhook_url: str = ""
+    alert_webhook_secret: str = ""
 
     @field_validator("model_specs", mode="before")
     @classmethod
@@ -987,11 +996,32 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         )
 
 
+def _build_notifier_from_config(config: ServerConfig) -> AlertNotifier | None:
+    notifiers: list[AlertNotifier] = []
+    slack_url = config.slack_webhook_url.strip()
+    if slack_url:
+        notifiers.append(UrllibSlackNotifier(slack_url))
+    webhook_url = config.alert_webhook_url.strip()
+    if webhook_url:
+        notifiers.append(
+            SignedWebhookNotifier(
+                webhook_url,
+                signing_secret=config.alert_webhook_secret,
+            )
+        )
+    if not notifiers:
+        return None
+    if len(notifiers) == 1:
+        return notifiers[0]
+    return CompositeAlertNotifier(notifiers)
+
+
 def create_server(
     host: str = "0.0.0.0",
     port: int = 8080,
     config: ServerConfig | None = None,
     model_registry: Mapping[str, type[BaseModel]] | None = None,
+    notifier: AlertNotifier | None = None,
 ) -> SelfHealHTTPServer:
     resolved_config = config or ServerConfig(host=host, port=port)
     resolved_models: Mapping[str, type[BaseModel]]
@@ -1001,6 +1031,9 @@ def create_server(
         resolved_models = _load_model_registry(resolved_config.model_specs)
     else:
         resolved_models = {}
+    resolved_notifier = (
+        notifier if notifier is not None else _build_notifier_from_config(resolved_config)
+    )
     registry = TenantRegistry(resolved_config)
     ledger = DriftLedger(db_path=resolved_config.db_path)
     billing_store = BillingStore(db_path=resolved_config.db_path)
@@ -1014,6 +1047,7 @@ def create_server(
         drift_ledger=ledger,
         billing_store=billing_store,
         installation_registry=installation_registry,
+        notifier=resolved_notifier,
     )
 
 
@@ -1036,6 +1070,9 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
     db_path_env = os.environ.get("SELFHEAL_DB_PATH", "").strip() or ":memory:"
     models_env = _parse_model_specs(os.environ.get("SELFHEAL_MODELS", ""))
+    slack_url_env = os.environ.get("SELFHEAL_SLACK_WEBHOOK_URL", "").strip()
+    alert_url_env = os.environ.get("SELFHEAL_ALERT_WEBHOOK_URL", "").strip()
+    alert_secret_env = os.environ.get("SELFHEAL_ALERT_WEBHOOK_SECRET", "")
     opts: dict[str, Any] = {
         "host": host_env,
         "port": port_env,
@@ -1046,6 +1083,9 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
         "max_llm_calls_per_tenant": llm_cap_env,
         "db_path": db_path_env,
         "model_specs": models_env,
+        "slack_webhook_url": slack_url_env,
+        "alert_webhook_url": alert_url_env,
+        "alert_webhook_secret": alert_secret_env,
     }
     return ServerConfig(**opts)
 
