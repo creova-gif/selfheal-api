@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 from pathlib import Path
@@ -514,3 +515,54 @@ def test_cli_replay_missing_or_invalid_corpus_returns_2(tmp_path: Path) -> None:
         ]
     )
     assert rc_missing_payload == 2
+
+
+def test_cli_doctor_json_and_never_leaks_api_key(monkeypatch: Any, capsys: Any) -> None:
+    secret_key = "sk-ant-secret-do-not-leak-99999"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret_key)
+
+    rc = main(["doctor", "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert secret_key not in captured.out
+    assert secret_key not in captured.err
+
+    data = json.loads(captured.out)
+    assert data["healthy"] is True
+    assert data["python_version"]["ok"] is True
+    assert data["packages"]["pydantic"]["available"] is True
+    assert isinstance(data["packages"]["pydantic"]["version"], str)
+    assert data["packages"]["libcst"]["available"] is True
+    assert isinstance(data["packages"]["libcst"]["version"], str)
+    assert set(data["binaries"].keys()) == {"ruff", "mypy", "pytest", "git", "gh"}
+    assert data["anthropic_api_key_configured"] is True
+
+
+def test_cli_doctor_human_readable_and_missing_dep_returns_1(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    secret_key = "sk-ant-secret-human-check-88888"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret_key)
+
+    rc_human = main(["doctor"])
+    assert rc_human == 0
+    captured_human = capsys.readouterr()
+    assert secret_key not in captured_human.out
+    assert secret_key not in captured_human.err
+    assert "python >= 3.12" in captured_human.out
+    assert "ANTHROPIC_API_KEY (configured)" in captured_human.out
+
+    real_import = importlib.import_module
+
+    def fake_import(name: str, package: str | None = None) -> Any:
+        if name == "libcst":
+            raise ImportError("simulated missing libcst")
+        return real_import(name, package)
+
+    with patch("selfheal_api.cli.importlib.import_module", side_effect=fake_import):
+        rc_fail = main(["doctor", "--json"])
+
+    assert rc_fail == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["healthy"] is False
+    assert data["packages"]["libcst"] == {"available": False, "version": None}

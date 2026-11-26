@@ -184,7 +184,7 @@ class RemediationQueue:
                     drifted_payload=item.drifted_payload,
                     canonical_payload=item.canonical_payload,
                 )
-                succeeded = outcome.status in {"pr_opened", "no_drift"}
+                succeeded = outcome.status in {"pr_opened", "no_drift", "deduplicated"}
             except Exception:
                 logger.exception(
                     "Remediation job failed for org=%s model=%s fingerprint=%s",

@@ -239,6 +239,38 @@ class DriftLedger:
             top_models=top_models,
         )
 
+    def ping(self) -> bool:
+        """Check database connectivity, returning False if closed or on SQLite errors."""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._conn.execute("SELECT 1").fetchone()
+            except sqlite3.Error:
+                return False
+        return True
+
+    def global_totals(self) -> dict[str, int]:
+        """Return global event counts across all organizations."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DriftLedger is closed")
+            row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN has_drift = 1 THEN 1 ELSE 0 END), 0),
+                    COUNT(CASE WHEN pr_url IS NOT NULL AND pr_url != '' THEN 1 END)
+                FROM drift_events
+                """
+            ).fetchone()
+        assert row is not None
+        return {
+            "total_events": int(row[0]),
+            "drifted_events": int(row[1]),
+            "prs_opened": int(row[2]),
+        }
+
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         with self._lock:

@@ -33,3 +33,10 @@
 - [x] Zero-PII `run_replay_corpus` deterministic regression harness for CI evaluation
 - [x] Public `selfheal_api` SDK `__all__` exports and `__version__ = "0.2.0"`
 - [x] Document ADR-006 (`docs/adr/006-background-remediation-worker-and-replay-harness.md`), `TASKS.md`, and `CHANGELOG.md`
+
+## Wave 7: Milestone 7 — Enterprise Hardening, Zero-Exec Runtime & Observability
+- [x] Pure-Python `apply_patch_plan_in_memory` refactor removing runtime `exec()`
+- [x] `RemediationPipeline` concurrency lock for safe serialized remediation & rollback
+- [x] Enterprise observability: `/readyz` readiness probe, `X-Request-Id` correlation, and Prometheus metrics
+- [x] `selfheal doctor` CLI subcommand (`--json` and human-readable checklist, zero-secret `ANTHROPIC_API_KEY` check)
+- [x] Document ADR-007 (`docs/adr/007-runtime-exec-removal-and-enterprise-observability.md`) and update `TASKS.md`

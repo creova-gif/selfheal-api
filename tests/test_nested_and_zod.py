@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import builtins
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, ConfigDict
 
 from sentinel import DriftKind, detect_drift
 from synthesizer import synthesize_patch, synthesize_zod_preprocessor, verify_patch
-from synthesizer.patcher import build_patch_plan
+from synthesizer.patcher import (
+    PatchAction,
+    PatchPlan,
+    apply_patch_plan_in_memory,
+    build_patch_plan,
+)
 
 
 class BillingAddress(BaseModel):
@@ -255,3 +262,181 @@ def test_zod_preprocessor_links_two_level_nested_models() -> None:
     assert "normalized['items']" in order_section
     assert "normalizeItemDrift(" in order_section
     assert "z.preprocess(normalizeOrderDrift, schema)" in order_section
+
+
+def test_apply_patch_plan_in_memory_zero_exec_and_coercions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _forbid_exec(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("exec() must not be called by apply_patch_plan_in_memory")
+
+    monkeypatch.setattr(builtins, "exec", _forbid_exec)
+
+    plan = PatchPlan(
+        model_name="Order",
+        actions=(
+            PatchAction(
+                target_model="Order",
+                target_field="zip_code",
+                drift_kind=DriftKind.MISSING_FIELD,
+                expected_type="int",
+                observed_kind="str",
+                source_path=("meta", "legacy", "zip"),
+                target_parent_path=("shipping", "address"),
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="order_id",
+                drift_kind=DriftKind.MISSING_FIELD,
+                expected_type="str",
+                observed_kind="str",
+                source_path=("legacyId",),
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="region",
+                drift_kind=DriftKind.MISSING_FIELD,
+                expected_type="str",
+                observed_kind="str",
+                source_path=("a", "b", "c", "region"),
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="missing_note",
+                drift_kind=DriftKind.MISSING_FIELD,
+                expected_type="str",
+                observed_kind="missing",
+                source_path=None,
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="retry_count",
+                drift_kind=DriftKind.NULLABILITY_DRIFT,
+                expected_type="int",
+                observed_kind="none",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="optional_note",
+                drift_kind=DriftKind.NULLABILITY_DRIFT,
+                expected_type="str | None",
+                observed_kind="none",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="amount",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="int",
+                observed_kind="str",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="flag_not_int",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="int",
+                observed_kind="bool",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="score",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="float",
+                observed_kind="str",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="active",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="bool",
+                observed_kind="str",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="label_val",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="str",
+                observed_kind="dict",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="label_name",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="str",
+                observed_kind="dict",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="label_id",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="str",
+                observed_kind="dict",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="tags",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="list[str]",
+                observed_kind="str",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="counts",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="list[int]",
+                observed_kind="list",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="ratios",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="list[float]",
+                observed_kind="list",
+            ),
+            PatchAction(
+                target_model="Order",
+                target_field="toggles",
+                drift_kind=DriftKind.TYPE_MISMATCH,
+                expected_type="list[bool]",
+                observed_kind="list",
+            ),
+        ),
+    )
+
+    payload: dict[str, Any] = {
+        "meta": {"legacy": {"zip": "94107"}},
+        "legacyId": "ord-99",
+        "a": {"b": {"c": {"region": "us-west"}}},
+        "retry_count": None,
+        "optional_note": None,
+        "amount": "42",
+        "flag_not_int": True,
+        "score": "3.5",
+        "active": "yes",
+        "label_val": {"value": "v1"},
+        "label_name": {"name": "n1"},
+        "label_id": {"id": "i1"},
+        "tags": "priority",
+        "counts": ["1", 2.0, True],
+        "ratios": ["1.5", 2, False],
+        "toggles": ["true", "0", 1],
+    }
+
+    normalized = apply_patch_plan_in_memory(payload, plan)
+
+    assert normalized["shipping"]["address"]["zip_code"] == 94107
+    assert normalized["order_id"] == "ord-99"
+    assert normalized["region"] == "us-west"
+    assert normalized["missing_note"] == ""
+    assert normalized["retry_count"] == 0
+    assert normalized["optional_note"] is None
+    assert normalized["amount"] == 42
+    assert normalized["flag_not_int"] is True
+    assert normalized["score"] == 3.5
+    assert normalized["active"] is True
+    assert normalized["label_val"] == "v1"
+    assert normalized["label_name"] == "n1"
+    assert normalized["label_id"] == "i1"
+    assert normalized["tags"] == ["priority"]
+    assert normalized["counts"] == [1, 2]
+    assert normalized["ratios"] == [1.5, 2.0]
+    assert normalized["toggles"] == [True, False, True]

@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from http import HTTPStatus
@@ -40,6 +41,7 @@ _logger = logging.getLogger("selfheal_api.server")
 
 SERVER_VERSION = "0.2.0"
 _ORG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
 class TenantConfig(BaseModel):
@@ -68,6 +70,7 @@ class ServerConfig(BaseModel):
     allow_unregistered_tenants: bool = True
     include_zod_adapter: bool = True
     max_body_bytes: int = Field(default=1_048_576, ge=1024)
+    db_path: str = ":memory:"
 
     def default_tenant_config(self) -> TenantConfig:
         opts: dict[str, Any] = {
@@ -236,6 +239,18 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         _logger.info("%s - %s", self.address_string(), format % args)
 
+    def _get_request_id(self) -> str:
+        cached: str | None = getattr(self, "_request_id", None)
+        if cached is not None:
+            return cached
+        raw_hdr = self.headers.get("X-Request-Id", "").strip()
+        if raw_hdr and _REQUEST_ID_RE.match(raw_hdr):
+            request_id = raw_hdr
+        else:
+            request_id = uuid.uuid4().hex[:16]
+        self._request_id = request_id
+        return request_id
+
     def _send_json(
         self,
         status: HTTPStatus,
@@ -246,6 +261,7 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Request-Id", self._get_request_id())
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -257,12 +273,55 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status.value)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Request-Id", self._get_request_id())
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; style-src 'unsafe-inline'",
         )
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_text(
+        self,
+        status: HTTPStatus,
+        text_body: str,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        body = text_body.encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Request-Id", self._get_request_id())
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _format_prometheus_metrics(self) -> str:
+        tenants_active = len(self.server.registry.list_org_ids())
+        installations_active = len(self.server.installation_registry.list_org_ids())
+        subscriptions_active = len(self.server.billing_store.list_org_ids())
+        totals = self.server.drift_ledger.global_totals()
+        lines = [
+            "# HELP selfheal_tenants_active Number of active tenant states",
+            "# TYPE selfheal_tenants_active gauge",
+            f"selfheal_tenants_active {tenants_active}",
+            "# HELP selfheal_installations_active Number of active GitHub installations",
+            "# TYPE selfheal_installations_active gauge",
+            f"selfheal_installations_active {installations_active}",
+            "# HELP selfheal_subscriptions_active Number of active billing subscriptions",
+            "# TYPE selfheal_subscriptions_active gauge",
+            f"selfheal_subscriptions_active {subscriptions_active}",
+            "# HELP selfheal_drift_events_total Total drift webhook events recorded",
+            "# TYPE selfheal_drift_events_total counter",
+            f"selfheal_drift_events_total {totals['total_events']}",
+            "# HELP selfheal_drifted_events_total Total drift events with detected drift",
+            "# TYPE selfheal_drifted_events_total counter",
+            f"selfheal_drifted_events_total {totals['drifted_events']}",
+            "# HELP selfheal_prs_opened_total Total remediation PRs opened",
+            "# TYPE selfheal_prs_opened_total counter",
+            f"selfheal_prs_opened_total {totals['prs_opened']}",
+            "",
+        ]
+        return "\n".join(lines)
 
     def _query_org_id(self, query: dict[str, list[str]]) -> str:
         org_vals = query.get("org_id")
@@ -281,7 +340,23 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                 {"status": "ok", "version": SERVER_VERSION},
             )
             return
+        if path == "/readyz":
+            if self.server.drift_ledger.ping():
+                self._send_json(HTTPStatus.OK, {"status": "ready"})
+            else:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"status": "unavailable"}
+                )
+            return
         if path == "/metrics":
+            fmt_vals = query.get("format")
+            if fmt_vals and fmt_vals[0].strip().lower() == "prometheus":
+                self._send_text(
+                    HTTPStatus.OK,
+                    self._format_prometheus_metrics(),
+                    content_type="text/plain; version=0.0.4; charset=utf-8",
+                )
+                return
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -509,60 +584,78 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        pre_report = detect_drift(expected_model, req.payload, mapping_provider=None)
-        pre_fp = compute_drift_fingerprint(pre_report)
-
-        is_new, cached_plan = tenant.deduplicator.begin(pre_fp)
-        report = pre_report
-        plan: PatchPlan | None = cached_plan
-        if is_new:
-            try:
-                if pre_report.has_drift and tenant.mapping_provider is not None:
-                    report = detect_drift(
-                        expected_model,
-                        req.payload,
-                        mapping_provider=tenant.mapping_provider,
-                    )
-                plan = build_patch_plan(report, root_model=expected_model)
-                tenant.deduplicator.complete(pre_fp, plan)
-            except Exception:
-                tenant.deduplicator.abort(pre_fp)
-                raise
-        elif plan is None:
-            plan = build_patch_plan(report, root_model=expected_model)
-        fingerprint = compute_drift_fingerprint(report)
-
-        include_zod = (
-            req.include_zod_adapter
-            if req.include_zod_adapter is not None
-            else self.server.config.include_zod_adapter
-        )
-        zod_adapter: str | None = None
-        if include_zod and plan.actions:
-            zod_adapter = synthesize_zod_preprocessor(plan)
-
-        issue_kinds = tuple(str(i.kind) for i in report.issues)
-        self.server.drift_ledger.record_event(
-            org_id=org_id_raw,
-            model_name=req.model,
-            fingerprint=fingerprint,
-            has_drift=report.has_drift,
-            issue_count=len(report.issues),
-            issue_kinds=issue_kinds,
-        )
-        if report.has_drift and is_new and self.server.notifier is not None:
-            self.server.notifier.notify(
-                DriftAlert(
-                    org_id=org_id_raw,
-                    model_name=req.model,
-                    fingerprint=fingerprint,
-                    issue_count=len(report.issues),
-                    issue_kinds=issue_kinds,
-                )
+        request_id = self._get_request_id()
+        try:
+            pre_report = detect_drift(
+                expected_model, req.payload, mapping_provider=None
             )
+            pre_fp = compute_drift_fingerprint(pre_report)
+
+            is_new, cached_plan = tenant.deduplicator.begin(pre_fp)
+            report = pre_report
+            plan: PatchPlan | None = cached_plan
+            if is_new:
+                try:
+                    if pre_report.has_drift and tenant.mapping_provider is not None:
+                        report = detect_drift(
+                            expected_model,
+                            req.payload,
+                            mapping_provider=tenant.mapping_provider,
+                        )
+                    plan = build_patch_plan(report, root_model=expected_model)
+                    tenant.deduplicator.complete(pre_fp, plan)
+                except Exception:
+                    tenant.deduplicator.abort(pre_fp)
+                    raise
+            elif plan is None:
+                plan = build_patch_plan(report, root_model=expected_model)
+            fingerprint = compute_drift_fingerprint(report)
+
+            include_zod = (
+                req.include_zod_adapter
+                if req.include_zod_adapter is not None
+                else self.server.config.include_zod_adapter
+            )
+            zod_adapter: str | None = None
+            if include_zod and plan.actions:
+                zod_adapter = synthesize_zod_preprocessor(plan)
+
+            issue_kinds = tuple(str(i.kind) for i in report.issues)
+            self.server.drift_ledger.record_event(
+                org_id=org_id_raw,
+                model_name=req.model,
+                fingerprint=fingerprint,
+                has_drift=report.has_drift,
+                issue_count=len(report.issues),
+                issue_kinds=issue_kinds,
+            )
+            if report.has_drift and is_new and self.server.notifier is not None:
+                self.server.notifier.notify(
+                    DriftAlert(
+                        org_id=org_id_raw,
+                        model_name=req.model,
+                        fingerprint=fingerprint,
+                        issue_count=len(report.issues),
+                        issue_kinds=issue_kinds,
+                    )
+                )
+        except Exception:
+            _logger.exception(
+                "drift_webhook_failed request_id=%s org_id=%s model=%s",
+                request_id,
+                org_id_raw,
+                req.model,
+            )
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "internal server error", "request_id": request_id},
+            )
+            return
 
         _logger.info(
-            "drift_webhook org_id=%s model=%s has_drift=%s fingerprint=%s deduplicated=%s",
+            "drift_webhook request_id=%s org_id=%s model=%s "
+            "has_drift=%s fingerprint=%s deduplicated=%s",
+            request_id,
             org_id_raw,
             req.model,
             report.has_drift,
@@ -592,12 +685,14 @@ def create_server(
 ) -> SelfHealHTTPServer:
     resolved_config = config or ServerConfig(host=host, port=port)
     registry = TenantRegistry(resolved_config)
+    ledger = DriftLedger(db_path=resolved_config.db_path)
     return SelfHealHTTPServer(
         (host, port),
         SelfHealRequestHandler,
         config=resolved_config,
         registry=registry,
         model_registry=model_registry or {},
+        drift_ledger=ledger,
     )
 
 
@@ -618,6 +713,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
     )
     rpm_env = int(os.environ.get("SELFHEAL_MAX_RPM", "60"))
     llm_cap_env = int(os.environ.get("SELFHEAL_MAX_LLM_CALLS", "20"))
+    db_path_env = os.environ.get("SELFHEAL_DB_PATH", "").strip() or ":memory:"
     opts: dict[str, Any] = {
         "host": host_env,
         "port": port_env,
@@ -626,6 +722,7 @@ def _load_config_from_env_and_file(config_path: str | None) -> ServerConfig:
         "github_webhook_secret": github_env,
         "max_requests_per_minute": rpm_env,
         "max_llm_calls_per_tenant": llm_cap_env,
+        "db_path": db_path_env,
     }
     return ServerConfig(**opts)
 
@@ -704,6 +801,8 @@ def main_server(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         _logger.info("Shutting down selfheal-server")
     finally:
+        if hasattr(server, "drift_ledger"):
+            server.drift_ledger.close()
         server.server_close()
     return 0
 

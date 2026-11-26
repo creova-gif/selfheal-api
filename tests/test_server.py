@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ from selfheal_api.server import (
     SelfHealHTTPServer,
     ServerConfig,
     TenantConfig,
+    _load_config_from_env_and_file,
     _load_model_registry,
     create_server,
     main_server,
@@ -597,3 +599,183 @@ def test_webhook_consults_billing_store_limits() -> None:
         assert tenant.rate_limiter._capacity == 30.0
         assert tenant.mapping_provider is not None
         assert tenant.mapping_provider._max_calls == 10
+
+
+def test_readyz_returns_ready_and_unavailable_when_closed() -> None:
+    config = ServerConfig()
+    with _running_server(config) as (server, base_url):
+        status, headers, data = _http_request(f"{base_url}/readyz")
+        assert status == 200
+        assert data == {"status": "ready"}
+        assert "X-Request-Id" in headers
+
+        server.drift_ledger.close()
+        status_down, _, data_down = _http_request(f"{base_url}/readyz")
+        assert status_down == 503
+        assert data_down == {"status": "unavailable"}
+
+
+def test_request_id_correlation_propagation_and_generation() -> None:
+    config = ServerConfig()
+    with _running_server(config) as (_, base_url):
+        # Valid alphanumeric/hyphen <=64 chars is propagated on JSON
+        status, headers, _ = _http_request(
+            f"{base_url}/healthz",
+            headers={"X-Request-Id": "req-trace-001"},
+        )
+        assert status == 200
+        assert headers.get("X-Request-Id") == "req-trace-001"
+
+        # Valid X-Request-Id propagated on HTML dashboard
+        d_req = urllib.request.Request(
+            f"{base_url}/dashboard?org_id=org-corr",
+            headers={"X-Request-Id": "dash-req-99"},
+        )
+        with urllib.request.urlopen(d_req, timeout=5.0) as d_resp:
+            assert d_resp.status == 200
+            assert d_resp.headers.get("X-Request-Id") == "dash-req-99"
+
+        # Invalid or oversized X-Request-Id is replaced by 16-char hex uuid
+        for bad_id in ("bad_underscore", "a" * 65, ""):
+            _, bad_headers, _ = _http_request(
+                f"{base_url}/healthz",
+                headers={"X-Request-Id": bad_id} if bad_id else {},
+            )
+            generated = bad_headers.get("X-Request-Id", "")
+            assert len(generated) == 16
+            assert all(c in "0123456789abcdef" for c in generated)
+
+
+def test_metrics_prometheus_format() -> None:
+    config = ServerConfig(
+        tenants={"org-prom": TenantConfig()},
+        allow_unregistered_tenants=True,
+    )
+    body = json.dumps(
+        {
+            "model": "OrderPayload",
+            "payload": {
+                "order_id": "not-an-int",
+                "customer_email": "bob@example.com",
+                "total_cents": 200,
+            },
+        }
+    ).encode("utf-8")
+
+    with _running_server(config) as (server, base_url):
+        server.billing_store.upsert_subscription(
+            SubscriptionState(org_id="org-prom", plan=PlanTier.PRO, status="active")
+        )
+        post_status, _, _ = _http_request(
+            f"{base_url}/webhooks/drift",
+            method="POST",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-SelfHeal-Org": "org-prom",
+            },
+        )
+        assert post_status == 200
+
+        req = urllib.request.Request(
+            f"{base_url}/metrics?format=prometheus",
+            headers={"X-Request-Id": "prom-123"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            text = resp.read().decode("utf-8")
+            assert resp.status == 200
+            assert (
+                resp.headers.get("Content-Type")
+                == "text/plain; version=0.0.4; charset=utf-8"
+            )
+            assert resp.headers.get("X-Request-Id") == "prom-123"
+            assert "selfheal_tenants_active 1" in text
+            assert "selfheal_installations_active 0" in text
+            assert "selfheal_subscriptions_active 1" in text
+            assert "selfheal_drift_events_total 1" in text
+            assert "selfheal_drifted_events_total 1" in text
+            assert "selfheal_prs_opened_total 0" in text
+
+
+def test_selfheal_db_path_persistence_and_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_file = tmp_path / "persisted" / "ledger.db"
+    monkeypatch.setenv("SELFHEAL_DB_PATH", str(db_file))
+    cfg = _load_config_from_env_and_file(None)
+    assert cfg.db_path == str(db_file)
+
+    body = json.dumps(
+        {
+            "model": "OrderPayload",
+            "payload": {
+                "order_id": "bad",
+                "customer_email": "alice@example.com",
+                "total_cents": 500,
+            },
+        }
+    ).encode("utf-8")
+
+    with _running_server(cfg) as (server1, base_url1):
+        status, _, _ = _http_request(
+            f"{base_url1}/webhooks/drift",
+            method="POST",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-SelfHeal-Org": "org-persist",
+            },
+        )
+        assert status == 200
+        server1.drift_ledger.close()
+
+    with _running_server(cfg) as (server2, base_url2):
+        ev_status, _, ev_data = _http_request(
+            f"{base_url2}/api/v1/events?org_id=org-persist"
+        )
+        assert ev_status == 200
+        assert len(ev_data["events"]) == 1
+        assert ev_data["events"][0]["model_name"] == "OrderPayload"
+        server2.drift_ledger.close()
+
+
+def test_drift_webhook_internal_error_returns_500_with_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated synthesis crash")
+
+    monkeypatch.setattr("selfheal_api.server.detect_drift", _boom)
+
+    config = ServerConfig()
+    body = json.dumps(
+        {
+            "model": "OrderPayload",
+            "payload": {
+                "order_id": 1,
+                "customer_email": "alice@example.com",
+                "total_cents": 100,
+            },
+        }
+    ).encode("utf-8")
+
+    with caplog.at_level("ERROR", logger="selfheal_api.server"):
+        with _running_server(config) as (_, base_url):
+            status, headers, data = _http_request(
+                f"{base_url}/webhooks/drift",
+                method="POST",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-SelfHeal-Org": "org-err",
+                    "X-Request-Id": "req-err-500",
+                },
+            )
+            assert status == 500
+            assert headers.get("X-Request-Id") == "req-err-500"
+            assert data == {
+                "error": "internal server error",
+                "request_id": "req-err-500",
+            }
+            assert any("req-err-500" in rec.message for rec in caplog.records)

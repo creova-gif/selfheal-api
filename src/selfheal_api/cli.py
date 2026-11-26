@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -280,7 +283,85 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional drifted payload JSON to synthesize a PatchPlan for replay",
     )
+
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Check Python, required libraries, CLI tools, and API key configuration",
+    )
+    doctor_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit diagnostic report as JSON",
+    )
     return parser
+
+
+def _check_package(package_name: str) -> dict[str, Any]:
+    """Check whether a Python package is importable and resolve its version."""
+    try:
+        mod = importlib.import_module(package_name)
+    except ImportError:
+        return {"available": False, "version": None}
+
+    version: str | None = getattr(mod, "__version__", None)
+    if not isinstance(version, str):
+        try:
+            version = importlib.metadata.version(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            version = None
+    return {"available": True, "version": version}
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Run local environment diagnostics without exposing secret values."""
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    python_ok = sys.version_info >= (3, 12)
+
+    pydantic_info = _check_package("pydantic")
+    libcst_info = _check_package("libcst")
+    pydantic_ok = bool(pydantic_info["available"])
+    libcst_ok = bool(libcst_info["available"])
+
+    binary_names = ("ruff", "mypy", "pytest", "git", "gh")
+    binary_paths = {name: shutil.which(name) for name in binary_names}
+    anthropic_configured = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    healthy = python_ok and pydantic_ok and libcst_ok
+
+    if args.json:
+        report: dict[str, Any] = {
+            "healthy": healthy,
+            "python_version": {"version": py_ver, "ok": python_ok},
+            "packages": {
+                "pydantic": pydantic_info,
+                "libcst": libcst_info,
+            },
+            "binaries": {
+                name: {"available": path is not None, "path": path}
+                for name, path in binary_paths.items()
+            },
+            "anthropic_api_key_configured": anthropic_configured,
+        }
+        print(json.dumps(report, indent=2))
+    else:
+        lines = [
+            f"[{'ok' if python_ok else 'FAIL'}] python >= 3.12 ({py_ver})",
+            f"[{'ok' if pydantic_ok else 'FAIL'}] pydantic "
+            f"({pydantic_info['version'] or 'not installed'})",
+            f"[{'ok' if libcst_ok else 'FAIL'}] libcst "
+            f"({libcst_info['version'] or 'not installed'})",
+        ]
+        for name, path in binary_paths.items():
+            status = "ok" if path is not None else "missing"
+            detail = path if path is not None else "not found"
+            lines.append(f"[{status}] {name} ({detail})")
+        lines.append(
+            f"[{'ok' if anthropic_configured else 'unset'}] ANTHROPIC_API_KEY "
+            f"({'configured' if anthropic_configured else 'not configured'})"
+        )
+        print("\n".join(lines))
+
+    return 0 if healthy else 1
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
@@ -305,6 +386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "doctor":
+        return _cmd_doctor(args)
     if args.command == "replay":
         return _cmd_replay(args)
 

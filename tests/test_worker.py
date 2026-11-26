@@ -163,7 +163,7 @@ def test_worker_deduplicates_org_and_fingerprint() -> None:
         assert stats.deduplicated == 1
         assert stats.processed == 4
         assert stats.succeeded == 4
-        assert len(github.opened_prs) == 4
+        assert len(github.opened_prs) == 2
     finally:
         worker.stop(timeout=5.0)
 

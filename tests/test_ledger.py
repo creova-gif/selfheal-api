@@ -205,3 +205,66 @@ def test_closed_ledger_raises_runtime_error_and_sets_busy_timeout() -> None:
 
     with pytest.raises(RuntimeError, match="DriftLedger is closed"):
         ledger.get_org_summary("org-1")
+
+
+def test_ping_and_global_totals() -> None:
+    ledger = DriftLedger(":memory:")
+    try:
+        assert ledger.ping() is True
+        assert ledger.global_totals() == {
+            "total_events": 0,
+            "drifted_events": 0,
+            "prs_opened": 0,
+        }
+
+        ledger.record_event(
+            "org-1",
+            "Order",
+            "fp-1",
+            True,
+            2,
+            ("missing_field",),
+            pr_url="https://github.com/acme/repo/pull/1",
+            created_at=10.0,
+        )
+        ledger.record_event(
+            "org-1",
+            "Order",
+            "fp-2",
+            False,
+            0,
+            (),
+            pr_url="",
+            created_at=20.0,
+        )
+        ledger.record_event(
+            "org-2",
+            "Invoice",
+            "fp-3",
+            True,
+            1,
+            ("type_mismatch",),
+            pr_url=None,
+            created_at=30.0,
+        )
+
+        assert ledger.global_totals() == {
+            "total_events": 3,
+            "drifted_events": 2,
+            "prs_opened": 1,
+        }
+    finally:
+        ledger.close()
+
+    assert ledger.ping() is False
+    with pytest.raises(RuntimeError, match="DriftLedger is closed"):
+        ledger.global_totals()
+
+
+def test_ping_returns_false_on_sqlite_error() -> None:
+    ledger = DriftLedger(":memory:")
+    ledger._conn.close()
+    try:
+        assert ledger.ping() is False
+    finally:
+        ledger._closed = True

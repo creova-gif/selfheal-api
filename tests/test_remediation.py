@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 from pydantic import BaseModel
 
 from selfheal_api.billing import BillingStore, PlanTier, SubscriptionState
@@ -254,3 +258,104 @@ class DifferentModel(BaseModel):
     assert len(github.opened_prs) == 0
     assert len(notifier.alerts) == 0
     assert ledger.get_org_summary("acme").prs_opened == 0
+
+
+def test_remediation_concurrent_duplicate_fingerprint_deduplicates() -> None:
+    pipeline, github, ledger, notifier = _build_pipeline()
+    original_open = github.open_pull_request
+    barrier = threading.Barrier(2)
+    first_entered = threading.Event()
+
+    def _slow_open_pr(**kwargs: str) -> dict[str, object]:
+        if not first_entered.is_set():
+            first_entered.set()
+            time.sleep(0.05)
+        return original_open(**kwargs)
+
+    github.open_pull_request = _slow_open_pr  # type: ignore[method-assign,assignment]
+
+    req = RemediationRequest(
+        org_id="acme",
+        repo="acme/orders",
+        model_name="OrderEvent",
+        model_source=ORDER_MODEL_SOURCE,
+    )
+
+    def _call() -> str:
+        barrier.wait(timeout=2.0)
+        outcome = pipeline.run(
+            req=req,
+            expected_model=OrderEvent,
+            drifted_payload={"orderId": "ord-1", "amount_cents": "4200"},
+            canonical_payload={"order_id": "ord-0", "amount_cents": 100},
+        )
+        return outcome.status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(lambda _: _call(), range(2)))
+
+    assert sorted(statuses) == ["deduplicated", "pr_opened"]
+    assert len(github.opened_prs) == 1
+    assert len(notifier.alerts) == 1
+    assert ledger.get_org_summary("acme").prs_opened == 1
+
+    # Subsequent call after completion also deduplicates and returns the opened PR URL
+    third = pipeline.run(
+        req=req,
+        expected_model=OrderEvent,
+        drifted_payload={"orderId": "ord-2", "amount_cents": "99"},
+        canonical_payload={"order_id": "ord-0", "amount_cents": 100},
+    )
+    assert third.status == "deduplicated"
+    assert third.pr_url == "https://github.com/acme/orders/pull/1"
+    assert len(github.opened_prs) == 1
+
+
+def test_remediation_concurrent_distinct_fingerprints_respect_quota() -> None:
+    # PlanTier.FREE has max_models=3; pre-populate 2 PRs so only 1 slot remains.
+    pipeline, github, ledger, _ = _build_pipeline(plan=PlanTier.FREE)
+    for idx in range(2):
+        ledger.record_event(
+            org_id="acme",
+            model_name="OrderEvent",
+            fingerprint=f"existing-fp-{idx}",
+            has_drift=True,
+            issue_count=1,
+            issue_kinds=("type_mismatch",),
+            pr_url=f"https://github.com/acme/orders/pull/{idx + 1}",
+        )
+
+    original_open = github.open_pull_request
+
+    def _slow_open_pr(**kwargs: str) -> dict[str, object]:
+        time.sleep(0.05)
+        return original_open(**kwargs)
+
+    github.open_pull_request = _slow_open_pr  # type: ignore[method-assign,assignment]
+
+    req = RemediationRequest(
+        org_id="acme",
+        repo="acme/orders",
+        model_name="OrderEvent",
+        model_source=ORDER_MODEL_SOURCE,
+    )
+    payloads = [
+        {"orderId": "ord-1", "amount_cents": "4200"},
+        {"order_id": "ord-2", "amount": "4200"},
+    ]
+    barrier = threading.Barrier(2)
+
+    def _run_payload(payload: dict[str, object]) -> str:
+        barrier.wait(timeout=2.0)
+        return pipeline.run(
+            req=req,
+            expected_model=OrderEvent,
+            drifted_payload=payload,
+        ).status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(_run_payload, payloads))
+
+    assert sorted(statuses) == ["pr_opened", "rejected_quota"]
+    assert len(github.opened_prs) == 1
+    assert ledger.get_org_summary("acme").prs_opened == 3

@@ -539,6 +539,156 @@ def synthesize_patch(
     )
 
 
+def _default_value_for_type(expected_type: str) -> Any:
+    exp = expected_type.lower()
+    if "none" in exp:
+        return None
+    if exp.startswith("list"):
+        return []
+    if exp.startswith("dict"):
+        return {}
+    if exp == "bool":
+        return False
+    if exp == "int":
+        return 0
+    if exp == "float":
+        return 0.0
+    if exp == "str":
+        return ""
+    return None
+
+
+def _coerce_value_for_type(val: Any, expected_type: str) -> Any:
+    """Coerce a runtime value in pure Python to match ``expected_type``."""
+    exp_lower = expected_type.lower()
+
+    if "list[" in exp_lower:
+        items = ([] if val is None else [val]) if not isinstance(val, list) else val
+        if "list[str]" in exp_lower:
+            return [str(item) for item in items]
+        if "list[int]" in exp_lower:
+            return [
+                int(float(item))
+                for item in items
+                if not isinstance(item, bool) and isinstance(item, (int, float, str))
+            ]
+        if "list[float]" in exp_lower:
+            return [
+                float(item)
+                for item in items
+                if not isinstance(item, bool) and isinstance(item, (int, float, str))
+            ]
+        if "list[bool]" in exp_lower:
+            return [
+                item.strip().lower() in ("true", "1", "yes")
+                if isinstance(item, str)
+                else bool(item)
+                for item in items
+            ]
+        return items
+
+    if "int" in exp_lower and "dict" not in exp_lower:
+        if isinstance(val, (str, float)) and not isinstance(val, bool):
+            try:
+                return int(float(val))
+            except (ValueError, TypeError):
+                return val
+        return val
+
+    if "float" in exp_lower and "dict" not in exp_lower:
+        if isinstance(val, (str, int)) and not isinstance(val, bool):
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return val
+        return val
+
+    if "bool" in exp_lower:
+        if isinstance(val, str):
+            lowered = val.strip().lower()
+            if lowered in ("true", "1", "yes"):
+                return True
+            if lowered in ("false", "0", "no"):
+                return False
+        elif isinstance(val, int) and not isinstance(val, bool):
+            return bool(val)
+        return val
+
+    if exp_lower in ("str", "str | none"):
+        if val is not None and not isinstance(val, str):
+            if isinstance(val, dict):
+                for k in ("id", "code", "value", "name", "email", "address"):
+                    if k in val and isinstance(val[k], str):
+                        return val[k]
+                return str(val)
+            return str(val)
+        return val
+
+    return val
+
+
+def _extract_from_path(
+    root: dict[str, Any], source_path: tuple[str | int, ...]
+) -> tuple[bool, Any]:
+    if not source_path:
+        return False, None
+    curr: Any = root
+    for part in source_path[:-1]:
+        part_key = str(part)
+        if not isinstance(curr, dict):
+            return False, None
+        nxt = curr.get(part_key)
+        if not isinstance(nxt, dict):
+            return False, None
+        curr = nxt
+    last_key = str(source_path[-1])
+    if isinstance(curr, dict) and last_key in curr:
+        return True, curr[last_key]
+    return False, None
+
+
+def _apply_action_in_memory(target: dict[str, Any], action: PatchAction) -> None:
+    """Apply a single PatchAction in-place on its target dict without exec()."""
+    field = action.target_field
+    exp = action.expected_type
+    exp_lower = exp.lower()
+
+    if action.target_parent_path and action.source_path is not None:
+        curr: dict[str, Any] = target
+        for p_attr in action.target_parent_path:
+            p_key = str(p_attr)
+            existing = curr.get(p_key)
+            if not isinstance(existing, dict):
+                existing = {}
+                curr[p_key] = existing
+            curr = existing
+
+        if field not in curr:
+            found, extracted = _extract_from_path(target, action.source_path)
+            if found:
+                curr[field] = extracted
+
+        if field in curr:
+            curr[field] = _coerce_value_for_type(curr[field], exp)
+        return
+
+    if action.source_path is not None and field not in target:
+        found, extracted = _extract_from_path(target, action.source_path)
+        if found:
+            target[field] = extracted
+
+    if action.drift_kind == DriftKind.MISSING_FIELD and action.source_path is None:
+        if field not in target:
+            target[field] = _default_value_for_type(exp)
+
+    if action.drift_kind == DriftKind.NULLABILITY_DRIFT and "none" not in exp_lower:
+        if target.get(field) is None:
+            target[field] = _default_value_for_type(exp)
+
+    if field in target:
+        target[field] = _coerce_value_for_type(target[field], exp)
+
+
 def _apply_action_to_target(
     target: dict[str, Any], action: PatchAction, preserve_parent: bool = False
 ) -> None:
@@ -548,10 +698,7 @@ def _apply_action_to_target(
         if action.target_parent_path and not preserve_parent
         else action
     )
-    code_lines = _coercion_lines_for_action(local_action)
-    if code_lines:
-        scope: dict[str, Any] = {"normalized": target}
-        exec("\n".join(code_lines), {}, scope)
+    _apply_action_in_memory(target, local_action)
 
 
 def _walk_and_apply(

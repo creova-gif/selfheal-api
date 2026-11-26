@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -87,6 +88,9 @@ class RemediationPipeline:
         self.github_client = github_client
         self.drift_ledger = drift_ledger
         self.notifier = notifier
+        self._lock = threading.Lock()
+        self._in_flight: set[tuple[str, str, str]] = set()
+        self._completed_prs: dict[tuple[str, str, str], str] = {}
 
     def run(
         self,
@@ -151,9 +155,89 @@ class RemediationPipeline:
                 detail=f"No schema drift detected for {req.model_name}",
             )
 
-        patch_res = synthesize_patch(req.model_source, report, root_model=expected_model)
-        verification = verify_patch(patch_res, drifted_payload, canonical_payload)
-        if not verification.passed:
+        dedup_key = (req.org_id, req.model_name, fingerprint)
+        with self._lock:
+            if dedup_key in self._completed_prs:
+                completed_url = self._completed_prs[dedup_key] or None
+                return RemediationOutcome(
+                    status="deduplicated",
+                    fingerprint=fingerprint,
+                    pr_url=completed_url,
+                    detail=f"Remediation PR already opened for {req.model_name}",
+                )
+            if dedup_key in self._in_flight:
+                return RemediationOutcome(
+                    status="deduplicated",
+                    fingerprint=fingerprint,
+                    detail=f"Remediation already in flight for {req.model_name}",
+                )
+
+            limits = self.billing_store.get_limits(req.org_id)
+            summary = self.drift_ledger.get_org_summary(req.org_id)
+            in_flight_for_org = [k for k in self._in_flight if k[0] == req.org_id]
+            distinct_models = set(summary.top_models.keys()) | {
+                k[1] for k in in_flight_for_org
+            }
+            if (
+                req.model_name not in distinct_models
+                and len(distinct_models) >= limits.max_models
+            ) or (summary.prs_opened + len(in_flight_for_org)) >= limits.max_models:
+                return RemediationOutcome(
+                    status="rejected_quota",
+                    fingerprint=fingerprint,
+                    detail=(
+                        f"Quota exceeded for org {req.org_id!r}: "
+                        f"{len(distinct_models)}/{limits.max_models} models"
+                    ),
+                )
+            self._in_flight.add(dedup_key)
+
+        try:
+            patch_res = synthesize_patch(
+                req.model_source, report, root_model=expected_model
+            )
+            verification = verify_patch(patch_res, drifted_payload, canonical_payload)
+            if not verification.passed:
+                self.drift_ledger.record_event(
+                    org_id=req.org_id,
+                    model_name=req.model_name,
+                    fingerprint=fingerprint,
+                    has_drift=True,
+                    issue_count=len(report.issues),
+                    issue_kinds=issue_kinds,
+                )
+                return RemediationOutcome(
+                    status="failed_verification",
+                    fingerprint=fingerprint,
+                    detail=verification.error_detail
+                    or "Patched model failed verification",
+                )
+
+            zod_adapter = synthesize_zod_preprocessor(patch_res.plan)
+            openapi_spec = emit_openapi_schema_patch(expected_model, patch_res.plan)
+
+            owner, repo_name = _split_owner_repo(req.repo, record)
+            pr_title = f"fix(selfheal): remediate schema drift for {req.model_name}"
+            pr_head = f"selfheal/{req.model_name.lower()}-{fingerprint[:12]}"
+            pr_body = _format_pr_body(
+                req=req,
+                fingerprint=fingerprint,
+                report=report,
+                patch_res=patch_res,
+                zod_adapter=zod_adapter,
+                openapi_yaml=openapi_spec.yaml_snippet,
+            )
+            pr_payload = self.github_client.open_pull_request(
+                owner=owner,
+                repo=repo_name,
+                title=pr_title,
+                head=pr_head,
+                base=req.base_branch,
+                body=pr_body,
+            )
+            raw_url = pr_payload.get("html_url")
+            pr_url = str(raw_url) if isinstance(raw_url, str) and raw_url else None
+
             self.drift_ledger.record_event(
                 org_id=req.org_id,
                 model_name=req.model_name,
@@ -161,65 +245,32 @@ class RemediationPipeline:
                 has_drift=True,
                 issue_count=len(report.issues),
                 issue_kinds=issue_kinds,
-            )
-            return RemediationOutcome(
-                status="failed_verification",
-                fingerprint=fingerprint,
-                detail=verification.error_detail or "Patched model failed verification",
+                pr_url=pr_url,
             )
 
-        zod_adapter = synthesize_zod_preprocessor(patch_res.plan)
-        openapi_spec = emit_openapi_schema_patch(expected_model, patch_res.plan)
+            with self._lock:
+                self._completed_prs[dedup_key] = pr_url or ""
 
-        owner, repo_name = _split_owner_repo(req.repo, record)
-        pr_title = f"fix(selfheal): remediate schema drift for {req.model_name}"
-        pr_head = f"selfheal/{req.model_name.lower()}-{fingerprint[:12]}"
-        pr_body = _format_pr_body(
-            req=req,
-            fingerprint=fingerprint,
-            report=report,
-            patch_res=patch_res,
-            zod_adapter=zod_adapter,
-            openapi_yaml=openapi_spec.yaml_snippet,
-        )
-        pr_payload = self.github_client.open_pull_request(
-            owner=owner,
-            repo=repo_name,
-            title=pr_title,
-            head=pr_head,
-            base=req.base_branch,
-            body=pr_body,
-        )
-        raw_url = pr_payload.get("html_url")
-        pr_url = str(raw_url) if isinstance(raw_url, str) and raw_url else None
-
-        self.drift_ledger.record_event(
-            org_id=req.org_id,
-            model_name=req.model_name,
-            fingerprint=fingerprint,
-            has_drift=True,
-            issue_count=len(report.issues),
-            issue_kinds=issue_kinds,
-            pr_url=pr_url,
-        )
-
-        if self.notifier is not None:
-            self.notifier.notify(
-                DriftAlert(
-                    org_id=req.org_id,
-                    model_name=req.model_name,
-                    fingerprint=fingerprint,
-                    issue_count=len(report.issues),
-                    issue_kinds=issue_kinds,
-                    pr_url=pr_url,
+            if self.notifier is not None:
+                self.notifier.notify(
+                    DriftAlert(
+                        org_id=req.org_id,
+                        model_name=req.model_name,
+                        fingerprint=fingerprint,
+                        issue_count=len(report.issues),
+                        issue_kinds=issue_kinds,
+                        pr_url=pr_url,
+                    )
                 )
-            )
 
-        return RemediationOutcome(
-            status="pr_opened",
-            fingerprint=fingerprint,
-            pr_url=pr_url,
-            zod_adapter=zod_adapter,
-            openapi_yaml=openapi_spec.yaml_snippet,
-            detail=f"Opened remediation PR for {req.model_name}",
-        )
+            return RemediationOutcome(
+                status="pr_opened",
+                fingerprint=fingerprint,
+                pr_url=pr_url,
+                zod_adapter=zod_adapter,
+                openapi_yaml=openapi_spec.yaml_snippet,
+                detail=f"Opened remediation PR for {req.model_name}",
+            )
+        finally:
+            with self._lock:
+                self._in_flight.discard(dedup_key)
