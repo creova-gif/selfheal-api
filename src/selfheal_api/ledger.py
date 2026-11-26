@@ -142,10 +142,13 @@ class DriftLedger:
         org_id: str | None = None,
         model_name: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[DriftEventRecord]:
         """List recent drift events, optionally filtered by org_id and model_name."""
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
 
         clauses: list[str] = []
         params: list[object] = []
@@ -159,6 +162,7 @@ class DriftLedger:
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
+        params.append(offset)
 
         query = f"""
             SELECT
@@ -174,7 +178,7 @@ class DriftLedger:
             FROM drift_events
             {where_sql}
             ORDER BY created_at DESC, event_id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
 
         with self._lock:

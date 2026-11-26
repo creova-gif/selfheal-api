@@ -608,13 +608,19 @@ def test_readyz_returns_ready_and_unavailable_when_closed() -> None:
     with _running_server(config) as (server, base_url):
         status, headers, data = _http_request(f"{base_url}/readyz")
         assert status == 200
-        assert data == {"status": "ready"}
+        assert data["status"] == "ready"
+        assert data["stores"] == {
+            "ledger": True,
+            "billing": True,
+            "installations": True,
+        }
         assert "X-Request-Id" in headers
 
         server.drift_ledger.close()
         status_down, _, data_down = _http_request(f"{base_url}/readyz")
         assert status_down == 503
-        assert data_down == {"status": "unavailable"}
+        assert data_down["status"] == "unavailable"
+        assert data_down["stores"]["ledger"] is False
 
 
 def test_request_id_correlation_propagation_and_generation() -> None:
@@ -1080,3 +1086,55 @@ def test_control_plane_sqlite_restart_persistence(tmp_path: Path) -> None:
         server2.drift_ledger.close()
         server2.billing_store.close()
         server2.installation_registry.close()
+
+
+def test_readyz_checks_all_control_plane_stores_and_events_pagination() -> None:
+    with _running_server(ServerConfig()) as (server, base_url):
+        status, _, body = _http_request(f"{base_url}/readyz")
+        assert status == 200
+        assert body["status"] == "ready"
+        assert body["stores"] == {
+            "ledger": True,
+            "billing": True,
+            "installations": True,
+        }
+
+        for i in range(4):
+            server.drift_ledger.record_event(
+                org_id="acme",
+                model_name="Invoice" if i % 2 == 0 else "Order",
+                fingerprint=f"fp-{i}",
+                has_drift=True,
+                issue_count=1,
+                created_at=2000.0 + i,
+            )
+
+        ev_status, _, ev_body = _http_request(
+            f"{base_url}/api/v1/events?org_id=acme&limit=2&offset=1"
+        )
+        assert ev_status == 200
+        assert ev_body["limit"] == 2
+        assert ev_body["offset"] == 1
+        assert [e["fingerprint"] for e in ev_body["events"]] == ["fp-2", "fp-1"]
+
+        m_status, _, m_body = _http_request(
+            f"{base_url}/api/v1/events?org_id=acme&model=Invoice&limit=10"
+        )
+        assert m_status == 200
+        assert [e["fingerprint"] for e in m_body["events"]] == ["fp-2", "fp-0"]
+
+        bad_status, _, _ = _http_request(
+            f"{base_url}/api/v1/events?org_id=acme&limit=999"
+        )
+        assert bad_status == 400
+
+        bad_int_status, _, _ = _http_request(
+            f"{base_url}/api/v1/events?org_id=acme&offset=abc"
+        )
+        assert bad_int_status == 400
+
+        server.billing_store.close()
+        down_status, _, down_body = _http_request(f"{base_url}/readyz")
+        assert down_status == 503
+        assert down_body["status"] == "unavailable"
+        assert down_body["stores"]["billing"] is False

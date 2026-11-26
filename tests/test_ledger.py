@@ -268,3 +268,25 @@ def test_ping_returns_false_on_sqlite_error() -> None:
         assert ledger.ping() is False
     finally:
         ledger._closed = True
+
+
+def test_list_events_supports_offset_pagination_and_validation() -> None:
+    ledger = DriftLedger(":memory:")
+    try:
+        for i in range(5):
+            ledger.record_event(
+                org_id="acme",
+                model_name="Invoice",
+                fingerprint=f"fp-{i}",
+                has_drift=True,
+                issue_count=1,
+                created_at=1000.0 + i,
+            )
+        page1 = ledger.list_events(org_id="acme", limit=2, offset=0)
+        page2 = ledger.list_events(org_id="acme", limit=2, offset=2)
+        assert [e.fingerprint for e in page1] == ["fp-4", "fp-3"]
+        assert [e.fingerprint for e in page2] == ["fp-2", "fp-1"]
+        with pytest.raises(ValueError, match="offset must be >= 0"):
+            ledger.list_events(org_id="acme", limit=2, offset=-1)
+    finally:
+        ledger.close()

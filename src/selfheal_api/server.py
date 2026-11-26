@@ -438,11 +438,17 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/readyz":
-            if self.server.drift_ledger.ping():
-                self._send_json(HTTPStatus.OK, {"status": "ready"})
+            stores = {
+                "ledger": self.server.drift_ledger.ping(),
+                "billing": self.server.billing_store.ping(),
+                "installations": self.server.installation_registry.ping(),
+            }
+            if all(stores.values()):
+                self._send_json(HTTPStatus.OK, {"status": "ready", "stores": stores})
             else:
                 self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE, {"status": "unavailable"}
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"status": "unavailable", "stores": stores},
                 )
             return
         if path == "/metrics":
@@ -475,11 +481,39 @@ class SelfHealRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.UNAUTHORIZED, {"error": "unauthorized tenant read"}
                 )
                 return
-            events = self.server.drift_ledger.list_events(org_id=org_id, limit=50)
+            try:
+                limit_raw = (query.get("limit") or ["50"])[0].strip()
+                offset_raw = (query.get("offset") or ["0"])[0].strip()
+                limit = int(limit_raw)
+                offset = int(offset_raw)
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit and offset must be integers"},
+                )
+                return
+            if limit < 1 or limit > 200 or offset < 0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit must be in 1..200 and offset >= 0"},
+                )
+                return
+            model_vals = query.get("model")
+            model_filter = (
+                model_vals[0].strip() if model_vals and model_vals[0].strip() else None
+            )
+            events = self.server.drift_ledger.list_events(
+                org_id=org_id,
+                model_name=model_filter,
+                limit=limit,
+                offset=offset,
+            )
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "org_id": org_id,
+                    "limit": limit,
+                    "offset": offset,
                     "events": [ev.model_dump(mode="json") for ev in events],
                 },
             )
